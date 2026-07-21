@@ -12,7 +12,7 @@ The panel subscribes to a configurable set of topics on the active live connecti
 - **Lookback budget** — bound the buffer by max seconds *or* max megabytes; oldest data is evicted past the budget. The byte budget measures the re-encoded JSON payload size (post-base64), not the wire size.
 - **Auto-save on rotation** — instead of silently dropping the oldest data when the budget is hit, flush the buffer to a file and start a fresh window.
 - **Dump on demand** — write the current buffer to an `.mcap` file at any time (non-destructive — the buffer keeps filling).
-- **Silent save to a chosen folder** — pick a directory once and both manual saves and auto-save rotations write files into it with no per-file dialog (Chromium-based builds only — Chrome/Edge desktop or web; elsewhere files download instead).
+- **Silent save to a chosen folder** — pick a directory (from the panel body or the settings sidebar) and both manual saves and auto-save rotations write files into it with no per-file dialog (Chromium-based builds only — Chrome/Edge desktop or web; elsewhere files download instead). The chosen folder is **persisted** (in IndexedDB), so it survives panel remounts and reloads; permission is re-verified at save time and falls back to a browser download if it can't be re-granted.
 - Runs the ring buffer and MCAP encoding in a **Web Worker**, off the main thread.
 - Works in both the desktop and web builds of Foxglove.
 
@@ -57,7 +57,7 @@ The re-encoder writes decoded objects back to JSON, so:
 - **int64 / uint64** (`BigInt`) fields are cast to `number`; large magnitudes lose precision (fine for typical timestamps/ids).
 - Binary blobs (images, point clouds) bloat under base64 (~1.33×) — a reason to select only the topics you need when using a byte budget.
 - The worker runs from a `Blob` URL. In the web app (`app.foxglove.dev`), a Content-Security-Policy that blocks `worker-src blob:` would prevent capture; verify in the target web build (the desktop app is unaffected).
-- The chosen save folder is **not persisted** across reloads (the directory handle is not JSON-serializable), so it is pick-once-per-session in this version.
+- The chosen save folder is persisted across reloads by storing the (structured-cloneable) directory handle in IndexedDB. The handle survives, but the OS may still require a permission re-grant on the first save after a reload; if it can't be re-granted, that save falls back to a browser download.
 
 ## Develop
 
