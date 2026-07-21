@@ -96,8 +96,10 @@ export function buildSettingsTree(
   };
 
   if (opts?.canPickDir === true) {
+    // Short single-line label so it fits inline in the node header (the full "Choose
+    // save folder…" wrapped awkwardly). The in-panel body offers the same picker.
     general.actions = [
-      { type: "action", id: "chooseSaveFolder", label: "Choose save folder…", display: "inline" },
+      { type: "action", id: "chooseSaveFolder", label: "Choose folder…", display: "inline" },
     ];
   } else {
     general.help =

@@ -3,8 +3,141 @@ import * as React from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { clearDirHandle, loadDirHandle, saveDirHandle } from "./fsStore";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
+
+// Extensions render plain React with no access to the app's MUI theme, so we drive
+// body colors from the watched color scheme with a small inline-style palette.
+type ColorScheme = "light" | "dark";
+
+type Theme = {
+  fg: string;
+  muted: string;
+  border: string;
+  buttonBg: string;
+  buttonHoverBg: string;
+  accentBg: string;
+  accentHoverBg: string;
+  accentFg: string;
+  accentText: string;
+};
+
+function makeTheme(scheme: ColorScheme): Theme {
+  if (scheme === "light") {
+    return {
+      fg: "#1f2329",
+      muted: "#6b7280",
+      border: "rgba(0, 0, 0, 0.15)",
+      buttonBg: "rgba(0, 0, 0, 0.05)",
+      buttonHoverBg: "rgba(0, 0, 0, 0.1)",
+      accentBg: "#1f6feb",
+      accentHoverBg: "#1a5fd0",
+      accentFg: "#ffffff",
+      accentText: "#1f6feb",
+    };
+  }
+  return {
+    fg: "#e6e6ea",
+    muted: "#9a9aa2",
+    border: "rgba(255, 255, 255, 0.16)",
+    buttonBg: "rgba(255, 255, 255, 0.09)",
+    buttonHoverBg: "rgba(255, 255, 255, 0.16)",
+    accentBg: "#4b8bff",
+    accentHoverBg: "#3d78e8",
+    accentFg: "#ffffff",
+    accentText: "#7db0ff",
+  };
+}
+
+type ButtonVariant = "primary" | "default" | "link";
+
+type ButtonState = { disabled: boolean; hover: boolean };
+
+function pickBg(state: ButtonState, base: string, hoverBg: string): string {
+  if (state.disabled) {
+    return base;
+  }
+  if (state.hover) {
+    return hoverBg;
+  }
+  return base;
+}
+
+function buttonStyle(
+  theme: Theme,
+  variant: ButtonVariant,
+  state: ButtonState,
+): React.CSSProperties {
+  const { disabled, hover } = state;
+  const base: React.CSSProperties = {
+    font: "inherit",
+    fontSize: "0.8125rem",
+    fontWeight: 500,
+    lineHeight: 1.2,
+    borderRadius: 4,
+    cursor: disabled ? "default" : "pointer",
+    opacity: disabled ? 0.5 : 1,
+    transition: "background 0.15s ease, color 0.15s ease",
+  };
+  if (variant === "link") {
+    return {
+      ...base,
+      padding: "0.1rem 0.2rem",
+      color: theme.accentText,
+      background: "transparent",
+      border: "none",
+      textDecoration: hover && !disabled ? "underline" : "none",
+    };
+  }
+  if (variant === "primary") {
+    return {
+      ...base,
+      padding: "0.45rem 0.9rem",
+      color: theme.accentFg,
+      background: pickBg(state, theme.accentBg, theme.accentHoverBg),
+      border: "1px solid transparent",
+    };
+  }
+  return {
+    ...base,
+    padding: "0.45rem 0.9rem",
+    color: theme.fg,
+    background: pickBg(state, theme.buttonBg, theme.buttonHoverBg),
+    border: `1px solid ${theme.border}`,
+  };
+}
+
+function ThemedButton({
+  theme,
+  variant = "default",
+  disabled = false,
+  onClick,
+  children,
+}: {
+  theme: Theme;
+  variant?: ButtonVariant;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={buttonStyle(theme, variant, { disabled, hover })}
+      onMouseEnter={() => {
+        setHover(true);
+      }}
+      onMouseLeave={() => {
+        setHover(false);
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 
 // The File System Access permission methods are not in every TS DOM lib; declare a
 // minimal shape rather than `any`-casting. (queryPermission/requestPermission live
@@ -109,7 +242,8 @@ async function ensureRwPermission(dirHandle: FileSystemDirectoryHandle): Promise
 function statSummary(stat: WorkerStat, config: DvrConfig): { used: string; cap: string } {
   if (config.budgetMode === "time") {
     const spanNanos = BigInt(stat.newestNanos) - BigInt(stat.oldestNanos);
-    const usedSec = stat.bufferedMsgs > 0 ? Number(spanNanos) / 1e9 : 0;
+    // Floor at zero so a transient backward time jump can never render negative.
+    const usedSec = stat.bufferedMsgs > 0 ? Math.max(0, Number(spanNanos) / 1e9) : 0;
     return { used: `${usedSec.toFixed(1)}s`, cap: `${config.budgetValue}s` };
   }
   const usedMb = stat.byteTotal / (1024 * 1024);
@@ -127,6 +261,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   }));
   const [saveFolderName, setSaveFolderName] = useState<string | undefined>(undefined);
   const [lastSaveStatus, setLastSaveStatus] = useState<string>("");
+  const [colorScheme, setColorScheme] = useState<ColorScheme>("dark");
 
   const workerRef = useRef<Worker | undefined>(undefined);
   const dirHandleRef = useRef<FileSystemDirectoryHandle | undefined>(undefined);
@@ -211,11 +346,70 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     };
   }, []);
 
+  // Restore a previously-picked save folder on mount. The handle persists in
+  // IndexedDB across remounts/reloads; we only restore it here (no requestPermission
+  // without a user gesture) — permission is re-verified lazily at save time.
+  useEffect(() => {
+    if (!canPickDir) {
+      return;
+    }
+    const active = { current: true };
+    void (async () => {
+      try {
+        const handle = await loadDirHandle();
+        if (active.current && handle != undefined) {
+          dirHandleRef.current = handle;
+          setSaveFolderName(handle.name);
+        }
+      } catch (err) {
+        console.error("[diy-dvr] failed to load saved folder", err);
+      }
+    })();
+    return () => {
+      active.current = false;
+    };
+  }, []);
+
+  // Open the directory picker (shared by the sidebar action and the in-body button)
+  // and persist the chosen handle to IndexedDB so it survives remounts/reloads.
+  const chooseSaveFolder = useCallback(() => {
+    void (async () => {
+      try {
+        const handle = await (
+          window as unknown as {
+            showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
+          }
+        ).showDirectoryPicker();
+        dirHandleRef.current = handle;
+        setSaveFolderName(handle.name);
+        try {
+          await saveDirHandle(handle);
+        } catch (err) {
+          console.error("[diy-dvr] failed to persist save folder", err);
+        }
+      } catch {
+        // user cancelled the picker — leave the existing handle in place
+      }
+    })();
+  }, []);
+
+  // Revert to browser-download saves and forget the stored folder.
+  const useBrowserDownload = useCallback(() => {
+    dirHandleRef.current = undefined;
+    setSaveFolderName(undefined);
+    void clearDirHandle().catch((err: unknown) => {
+      console.error("[diy-dvr] failed to clear saved folder", err);
+    });
+  }, []);
+
   // Forward every message from every subscribed topic to the worker.
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
       if (renderState.topics) {
         setTopics(renderState.topics);
+      }
+      if (renderState.colorScheme) {
+        setColorScheme(renderState.colorScheme);
       }
       const frame = renderState.currentFrame;
       const worker = workerRef.current;
@@ -236,6 +430,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     };
     context.watch("topics");
     context.watch("currentFrame");
+    context.watch("colorScheme");
   }, [context]);
 
   // Subscribe to exactly the enabled topics; re-subscribe when the set changes.
@@ -267,19 +462,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       // Button clicks arrive as perform-node-action — handle BEFORE any non-update bail.
       if (action.action === "perform-node-action") {
         if (action.payload.id === "chooseSaveFolder") {
-          void (async () => {
-            try {
-              const handle = await (
-                window as unknown as {
-                  showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
-                }
-              ).showDirectoryPicker();
-              dirHandleRef.current = handle;
-              setSaveFolderName(handle.name);
-            } catch {
-              // user cancelled the picker — leave the existing handle in place
-            }
-          })();
+          chooseSaveFolder();
         }
         return;
       }
@@ -293,7 +476,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       setConfig(next);
       context.saveState(next);
     },
-    [context],
+    [context, chooseSaveFolder],
   );
 
   // (Re)render the settings editor on mount and whenever inputs change.
@@ -317,70 +500,86 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const budget = statSummary(stat, config);
   const captureOn = workerReady && enabledTopics.length > 0;
   const saveDestination = saveFolderName ?? "Browser download";
+  const theme = makeTheme(colorScheme);
+
+  const statRows: Array<{ label: string; value: React.ReactNode }> = [
+    { label: "Worker", value: workerReady ? "Ready" : "Starting…" },
+    { label: "Capture", value: captureOn ? "On" : "Off" },
+    { label: "Topics subscribed", value: `${enabledTopics.length} / ${topics.length}` },
+    { label: "Messages forwarded", value: forwarded },
+    { label: "Budget used", value: `${budget.used} / ${budget.cap}` },
+    { label: "Rotations", value: stat.rotations },
+    { label: "Buffered", value: `${stat.bufferedMsgs} msgs / ${stat.channels} channels` },
+    { label: "Save destination", value: saveDestination },
+    { label: "Last save", value: lastSaveStatus.length > 0 ? lastSaveStatus : "—" },
+  ];
 
   return (
-    <div style={{ padding: "1rem", fontFamily: "sans-serif", lineHeight: 1.5 }}>
-      <h2 style={{ margin: "0 0 0.5rem" }}>DIY DVR</h2>
-      <p style={{ margin: "0 0 1rem", opacity: 0.7 }}>
-        Forwards enabled-topic messages to a Web Worker, which buffers them in a bounded ring and
-        encodes them to MCAP. Save dumps the buffer; auto-save rotates a full window to a file.
-      </p>
-
-      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
-        <button onClick={onSave} disabled={!workerReady} style={{ padding: "0.5rem 1rem" }}>
+    <div
+      style={{
+        padding: "1rem",
+        fontFamily: "inherit",
+        fontSize: "0.8125rem",
+        lineHeight: 1.5,
+        color: theme.fg,
+      }}
+    >
+      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.85rem" }}>
+        <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onSave}>
           Save MCAP
-        </button>
-        <button onClick={onReset} disabled={!workerReady} style={{ padding: "0.5rem 1rem" }}>
+        </ThemedButton>
+        <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onReset}>
           Reset buffer
-        </button>
+        </ThemedButton>
       </div>
 
-      <table style={{ borderSpacing: "0.5rem 0.25rem" }}>
-        <tbody>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Worker</td>
-            <td>{workerReady ? "ready" : "starting…"}</td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Capture</td>
-            <td>{captureOn ? "on" : "off"}</td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Topics subscribed</td>
-            <td>
-              {enabledTopics.length} / {topics.length}
-            </td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Messages forwarded</td>
-            <td>{forwarded}</td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Budget used</td>
-            <td>
-              {budget.used} / {budget.cap}
-            </td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Rotations</td>
-            <td>{stat.rotations}</td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Buffered in worker</td>
-            <td>
-              {stat.bufferedMsgs} msgs / {stat.channels} channels
-            </td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Save destination</td>
-            <td>{saveDestination}</td>
-          </tr>
-          <tr>
-            <td style={{ opacity: 0.7 }}>Last save</td>
-            <td>{lastSaveStatus.length > 0 ? lastSaveStatus : "—"}</td>
-          </tr>
-        </tbody>
-      </table>
+      {canPickDir && (
+        <div style={{ marginBottom: "0.85rem" }}>
+          {saveFolderName == undefined ? (
+            <ThemedButton theme={theme} variant="primary" onClick={chooseSaveFolder}>
+              Choose save folder…
+            </ThemedButton>
+          ) : (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "0.4rem",
+                flexWrap: "wrap",
+              }}
+            >
+              <span style={{ color: theme.muted }}>Saving to</span>
+              <span style={{ color: theme.fg, fontWeight: 600, wordBreak: "break-all" }}>
+                {saveFolderName}
+              </span>
+              <ThemedButton theme={theme} variant="link" onClick={chooseSaveFolder}>
+                Change…
+              </ThemedButton>
+              <ThemedButton theme={theme} variant="link" onClick={useBrowserDownload}>
+                Use browser download
+              </ThemedButton>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "grid", rowGap: "0.15rem", marginBottom: "0.85rem" }}>
+        {statRows.map((row) => (
+          <div
+            key={row.label}
+            style={{ display: "flex", justifyContent: "space-between", gap: "1rem" }}
+          >
+            <span style={{ color: theme.muted }}>{row.label}</span>
+            <span style={{ color: theme.fg, textAlign: "right", wordBreak: "break-word" }}>
+              {row.value}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <p style={{ margin: 0, color: theme.muted, fontSize: "0.75rem" }}>
+        Topics, budget, and auto-save are in panel Settings (gear icon).
+      </p>
     </div>
   );
 }
