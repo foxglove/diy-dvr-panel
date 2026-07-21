@@ -7,10 +7,12 @@ The panel subscribes to a configurable set of topics on the active live connecti
 ## Features
 
 - Capture live messages off any Foxglove WebSocket source into an in-memory ring buffer.
-- **Topic selection** — choose which topics to DVR (default: all advertised topics).
-- **Lookback budget** — bound the buffer by max seconds *or* max bytes; oldest data is evicted past the budget.
+- **Panel settings editor** — configure everything from the layout settings sidebar; the config is persisted with the layout.
+- **Topic selection** — choose which topics to DVR via per-topic toggles (default: all advertised topics).
+- **Lookback budget** — bound the buffer by max seconds *or* max megabytes; oldest data is evicted past the budget. The byte budget measures the re-encoded JSON payload size (post-base64), not the wire size.
 - **Auto-save on rotation** — instead of silently dropping the oldest data when the budget is hit, flush the buffer to a file and start a fresh window.
-- **Dump on demand** — write the current buffer to an `.mcap` file at any time.
+- **Dump on demand** — write the current buffer to an `.mcap` file at any time (non-destructive — the buffer keeps filling).
+- **Silent save to a chosen folder** — pick a directory once and both manual saves and auto-save rotations write files into it with no per-file dialog (Chromium-based builds only — Chrome/Edge desktop or web; elsewhere files download instead).
 - Runs the ring buffer and MCAP encoding in a **Web Worker**, off the main thread.
 - Works in both the desktop and web builds of Foxglove.
 
@@ -20,7 +22,7 @@ Foxglove hands an extension panel **decoded message objects** and a schema *name
 
 1. The panel subscribes to the selected topics and forwards each decoded message to a Web Worker.
 2. The worker JSON-encodes every message (byte arrays → base64), resolves a real schema per topic by name, and appends it to a bounded ring buffer.
-3. On dump / auto-save, the worker frames the buffer into a **fully indexed** MCAP via `@mcap/core` and hands the bytes back to the panel, which downloads the file.
+3. On dump / auto-save, the worker frames the buffer into a **fully indexed** MCAP via `@mcap/core` and hands the bytes back to the panel. The panel writes the file — silently into a previously-chosen directory when available, otherwise as a browser download.
 4. You open that file as a new data source for full scrub-back — no changes to the core app required.
 
 Because the output is JSON-encoded MCAP with schemas that Foxglove reads natively, the dumped file re-opens and renders exactly like the live view.
@@ -53,7 +55,9 @@ The re-encoder writes decoded objects back to JSON, so:
 
 - **Original wire encoding is not preserved** — output is JSON-encoded MCAP. Acceptable because Foxglove reads it back natively.
 - **int64 / uint64** (`BigInt`) fields are cast to `number`; large magnitudes lose precision (fine for typical timestamps/ids).
-- Binary blobs (images, point clouds) bloat under base64 — a reason to select only the topics you need when using a byte budget.
+- Binary blobs (images, point clouds) bloat under base64 (~1.33×) — a reason to select only the topics you need when using a byte budget.
+- The worker runs from a `Blob` URL. In the web app (`app.foxglove.dev`), a Content-Security-Policy that blocks `worker-src blob:` would prevent capture; verify in the target web build (the desktop app is unaffected).
+- The chosen save folder is **not persisted** across reloads (the directory handle is not JSON-serializable), so it is pick-once-per-session in this version.
 
 ## Develop
 
