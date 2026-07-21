@@ -2,7 +2,7 @@
   "name": "DiyDvrExtension",
   "displayName": "DIY DVR",
   "description": "Rolling in-memory buffer of a live Foxglove WebSocket connection, dumped to MCAP for full scrub-back. Poor-man's DVR for live data, no core app changes.",
-  "publisher": "foxglovefde",
+  "publisher": "foxglove",
   "homepage": "",
   "version": "0.1.0",
   "license": "UNLICENSED",
