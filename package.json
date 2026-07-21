@@ -1,0 +1,48 @@
+{
+  "name": "DiyDvrExtension",
+  "displayName": "DIY DVR",
+  "description": "Rolling in-memory buffer of a live Foxglove WebSocket connection, dumped to MCAP for full scrub-back. Poor-man's DVR for live data, no core app changes.",
+  "publisher": "foxglovefde",
+  "homepage": "",
+  "version": "0.1.0",
+  "license": "UNLICENSED",
+  "main": "./dist/extension.js",
+  "keywords": ["dvr", "recording", "buffer", "mcap", "websocket", "live"],
+  "scripts": {
+    "bundle:worker": "node scripts/bundle-worker.mjs",
+    "build": "node scripts/bundle-worker.mjs && foxglove-extension build",
+    "foxglove:prepublish": "node scripts/bundle-worker.mjs && foxglove-extension build --mode production",
+    "validate:mcap": "node scripts/validate-mcap.mjs",
+    "lint": "eslint .",
+    "lint:ci": "eslint .",
+    "lint:fix": "eslint --fix .",
+    "local-install": "node scripts/bundle-worker.mjs && foxglove-extension install",
+    "package": "foxglove-extension package",
+    "pretest": "foxglove-extension pretest"
+  },
+  "devDependencies": {
+    "@foxglove/eslint-plugin": "2.1.0",
+    "@foxglove/extension": "^2.53.1",
+    "@types/react": "18.2.17",
+    "@types/react-dom": "18.2.7",
+    "create-foxglove-extension": "^1.3.2",
+    "eslint": "9.37.0",
+    "eslint-plugin-react": "7.37.5",
+    "prettier": "3.6.2",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "typescript": "5.1.6"
+  },
+  "dependencies": {
+    "@foxglove/rosmsg-msgs-common": "^3.2.3",
+    "@foxglove/schemas": "^2.1.0",
+    "@mcap/core": "^2.2.1",
+    "esbuild": "^0.24.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"],
+    "overrides": {
+      "eslint-plugin-import": "2.32.0"
+    }
+  }
+}

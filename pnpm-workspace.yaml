@@ -1,0 +1,3 @@
+# Standalone repo root. This empty workspace file stops pnpm from walking up
+# into a parent workspace (e.g. when this repo lives nested under another).
+packages: []
