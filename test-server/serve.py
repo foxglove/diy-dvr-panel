@@ -70,10 +70,12 @@ def main() -> None:
                 logging.info("Done (--once); stopping")
                 break
             logging.info("Looping")
-            # Reset the session clock/history so a connected client restarts from the
-            # top, but KEEP the Channel objects: they stay registered across sessions,
-            # and re-creating a channel for an existing topic is rejected by the SDK.
-            server.clear_session()
+            # Do NOT call server.clear_session() here. It assigns a new session ID and
+            # re-sends ServerInfo, which the client reads as "this is a new server
+            # instance" and responds to by discarding its channel state — that is what
+            # caused topics to disappear on every loop. A fresh TimeTracker per lap plus
+            # the existing broadcast_time() calls reset the client's clock at each loop
+            # boundary; channels stay advertised because we never touch the session.
     except KeyboardInterrupt:
         pass
     finally:
