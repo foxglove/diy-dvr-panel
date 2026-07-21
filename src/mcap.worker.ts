@@ -101,7 +101,7 @@ function jsonReplacer(_key: string, value: unknown): unknown {
 
 function encodeMessage(message: unknown): Uint8Array {
   try {
-    if (message === undefined) {
+    if (message == undefined) {
       return encoder.encode("null");
     }
     const json = JSON.stringify(message, jsonReplacer);
