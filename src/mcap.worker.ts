@@ -124,7 +124,36 @@ function snapshotSchemaMap(): Map<string, DvrSchema> {
   return schemas;
 }
 
+/**
+ * Insert a record keeping `records` sorted ascending by `logTime`. Messages usually
+ * arrive in publish-time order (fast-path push at the tail), but a source that jumps
+ * time backward (e.g. a looping replay) can deliver out-of-order times. Keeping the
+ * array sorted means `records[0]` is always the min-`logTime` record and the last is
+ * the max, so span reporting and oldest-first eviction stay correct.
+ */
+function insertRecord(record: DvrRecord): void {
+  const n = records.length;
+  const last = records[n - 1];
+  if (last == undefined || record.logTime >= last.logTime) {
+    records.push(record);
+    return;
+  }
+  let lo = 0;
+  let hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const midRecord = records[mid];
+    if (midRecord != undefined && midRecord.logTime <= record.logTime) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  records.splice(lo, 0, record);
+}
+
 function postStat(): void {
+  // `records` is kept sorted by logTime, so the ends are the min/max of the window.
   const oldest = records[0];
   const newest = records[records.length - 1];
   ctx.postMessage({
@@ -200,6 +229,9 @@ function rotateOrEvict(): boolean {
     postStat();
     return true;
   }
+  // `records` is sorted by logTime, so records[0] is the oldest record — shifting it
+  // always shrinks the buffered span (unlike shifting by arrival order, which can
+  // leave the min/max untouched and over-evict the window under out-of-order times).
   const gone = records.shift();
   if (gone != undefined) {
     byteTotal -= gone.data.byteLength;
@@ -231,9 +263,12 @@ function handleMessage(msg: Extract<InboundMessage, { type: "msg" }>): void {
     existing.schema = mergeJsonSchema(existing.schema, rootSchema(msg.message));
   }
 
-  const logTime = toNanos(msg.receiveTime);
+  // Key the buffered/saved timeline off the message's published time (the source's
+  // own clock) when present, falling back to receive/wall time. This keeps the ring
+  // and the saved MCAP consistent even when arrival order differs from publish order.
+  const logTime = toNanos(msg.publishTime ?? msg.receiveTime);
   const data = encodeMessage(msg.message);
-  records.push({
+  insertRecord({
     topic: msg.topic,
     logTime,
     publishTime: msg.publishTime != undefined ? toNanos(msg.publishTime) : logTime,
