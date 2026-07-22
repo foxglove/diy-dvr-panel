@@ -1,10 +1,10 @@
 {
   "name": "DiyDvrExtension",
   "displayName": "DIY DVR",
-  "description": "Rolling in-memory buffer of a live Foxglove WebSocket connection, dumped to MCAP for full scrub-back. Poor-man's DVR for live data, no core app changes.",
+  "description": "Save data from a live Foxglove WebSocket connection to disk from a panel. Keep a rolling time- or size-bounded buffer and dump it to MCAP on demand, or auto-save each window as the limit is reached, then re-open the file for full scrub-back.",
   "publisher": "foxglove",
-  "homepage": "",
-  "version": "0.1.0",
+  "homepage": "https://github.com/foxglove/diy-dvr-panel",
+  "version": "0.2.5",
   "license": "UNLICENSED",
   "main": "./dist/extension.js",
   "keywords": ["dvr", "recording", "buffer", "mcap", "websocket", "live"],

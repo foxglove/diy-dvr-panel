@@ -19,9 +19,9 @@ as a zero-install PEP 723 script and defaulted to a non-conflicting port.
 
 Usage (needs `uv`: https://docs.astral.sh/uv/):
     uv run serve.py --file path/to/recording.mcap
-    uv run serve.py --file rec.mcap --port 8767 --once
+    uv run serve.py --file rec.mcap --port 9000 --once   # override the default port
 
-Then point the Foxglove app (or the DVR Spike panel) at ws://127.0.0.1:8767.
+Then point the Foxglove app (or the DIY DVR panel) at ws://127.0.0.1:8765.
 """
 
 import argparse
@@ -35,8 +35,9 @@ import mcap.records
 from foxglove import Channel, Schema
 from foxglove.websocket import Capability, WebSocketServer
 
-# Default to 8767, NOT 8765: the Foxglove default WS port collides with the app.
-DEFAULT_PORT = 8767
+# Default to 8765, the standard Foxglove WebSocket port: the app's "Open connection"
+# dialog defaults to it, so the app connects to this server with no extra config.
+DEFAULT_PORT = 8765
 
 channels: dict[str, Channel] = {}
 
@@ -70,10 +71,12 @@ def main() -> None:
                 logging.info("Done (--once); stopping")
                 break
             logging.info("Looping")
-            # Reset the session clock/history so a connected client restarts from the
-            # top, but KEEP the Channel objects: they stay registered across sessions,
-            # and re-creating a channel for an existing topic is rejected by the SDK.
-            server.clear_session()
+            # Do NOT call server.clear_session() here. It assigns a new session ID and
+            # re-sends ServerInfo, which the client reads as "this is a new server
+            # instance" and responds to by discarding its channel state — that is what
+            # caused topics to disappear on every loop. A fresh TimeTracker per lap plus
+            # the existing broadcast_time() calls reset the client's clock at each loop
+            # boundary; channels stay advertised because we never touch the session.
     except KeyboardInterrupt:
         pass
     finally:

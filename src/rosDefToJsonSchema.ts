@@ -33,10 +33,12 @@ const SCALAR_TYPE: Record<string, JsonSchema> = {
   wstring: { type: "string" },
 };
 
-// ROS time/duration decode to { sec, nanosec }.
+// Foxglove decodes ROS time/duration to { sec, nsec } (its own foxglove.* schemas
+// use nsec too), even though the ROS2 IDL field is named nanosec. The panel encodes
+// the decoded object verbatim, so the schema must use nsec to match the data.
 const TIME_SCHEMA: JsonSchema = {
   type: "object",
-  properties: { sec: { type: "integer" }, nanosec: { type: "integer" } },
+  properties: { sec: { type: "integer" }, nsec: { type: "integer" } },
 };
 
 // Only UNSIGNED byte arrays go to base64. The app decodes contentEncoding:base64
