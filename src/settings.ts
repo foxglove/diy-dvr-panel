@@ -84,20 +84,44 @@ export function buildSettingsTree(
     },
   };
 
-  const folderIsSet = opts?.saveFolderName != undefined;
+  const folderName = opts?.saveFolderName;
+  const folderIsSet = folderName != undefined;
 
-  // Group the save-destination controls together: the Save folder display, the
-  // Choose-folder affordance, and (only once a folder is set) Auto-save. Rendering
-  // Auto-save without a folder would dump every rotation to the native download
-  // dialog, so gate it on a folder being chosen.
-  const savingFields: SettingsTreeFields = {
-    saveFolder: {
-      label: "Save folder",
+  // Group the save-destination controls together: the "Save destination" picker
+  // field, and (only once a folder is set) Auto-save. Rendering Auto-save without a
+  // folder would dump every rotation to the native download dialog, so gate it on a
+  // folder being chosen.
+  const savingFields: SettingsTreeFields = {};
+
+  if (opts?.canPickDir === true) {
+    // A settings-field change is a user gesture, so the panel opens the directory
+    // picker (and requests write permission) from the "choose" update under
+    // transient activation. When a folder is set it is shown as the selected value.
+    const destinationOptions = folderIsSet
+      ? [
+          { label: folderName, value: "current" },
+          { label: "Choose folder…", value: "choose" },
+          { label: "Browser download", value: "download" },
+        ]
+      : [
+          { label: "Browser download", value: "download" },
+          { label: "Choose folder…", value: "choose" },
+        ];
+    savingFields.saveDestination = {
+      label: "Save destination",
+      input: "select",
+      value: folderIsSet ? "current" : "download",
+      options: destinationOptions,
+    };
+  } else {
+    savingFields.saveDestination = {
+      label: "Save destination",
       input: "string",
-      value: opts?.saveFolderName ?? "Browser download",
+      value: "Browser download",
       readonly: true,
-    },
-  };
+    };
+  }
+
   if (folderIsSet) {
     savingFields.autoSave = {
       label: "Auto-save on rotation",
@@ -112,14 +136,8 @@ export function buildSettingsTree(
   };
 
   if (opts?.canPickDir === true) {
-    // The choose action lives on the Saving node so it renders next to the
-    // Save-folder / Auto-save controls it relates to. Short single-line label so
-    // it fits inline in the node header. The in-panel body offers the same picker.
-    saving.actions = [
-      { type: "action", id: "chooseSaveFolder", label: "Choose folder…", display: "inline" },
-    ];
     if (!folderIsSet) {
-      saving.help = "Set a save folder to enable auto-save.";
+      saving.help = "Choose a save folder to enable silent save and auto-save.";
     }
   } else {
     saving.help =
