@@ -1,5 +1,11 @@
 # DiyDvrExtension version history
 
+## 0.2.3
+
+- **Deterministic silent save** — the File System Access write-permission handshake is now only ever *requested* inside a live user gesture (the Save button click, the Auto-save toggle, or the "Save destination" settings action), and the gesture-less worker "saved" callback only ever *queries* the grant. Chromium only grants `requestPermission({mode:"readwrite"})` under transient activation and does not durably keep the grant, so requesting it from the async callback failed silently and fell back to the native Save dialog. Manual **Save** now acquires the grant inside the click and writes silently every time; the permission helper was split into `requestRwPermission` (gesture-only) and `hasRwPermission` (query-only).
+- **Honest auto-save** — auto-save rotations write silently while the grant is live; when the grant has lapsed (reload / focus loss / inactivity) they no longer pop a dialog or silently download but show "Auto-save paused — click Save to re-grant folder access". Turning Auto-save on pre-warms the grant inside that toggle gesture and won't enable if permission is denied.
+- **Choose-folder is a settings field** — the Saving node's detached "Choose folder…" header action is replaced by a "Save destination" select field (current folder / Choose folder… / Browser download). The in-panel body picker button remains as a reliable gesture path.
+
 ## 0.2.2
 
 - **Schema time field matches the data** — synthesized ROS2 schemas now declare the nanoseconds field as `nsec` (e.g. `header.stamp.nsec`), matching Foxglove's decoded message representation and its own `foxglove.*` schemas, instead of the ROS2 IDL name `nanosec`. The panel encodes the decoded object verbatim, so a saved MCAP's schema now agrees with its message data.

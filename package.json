@@ -4,7 +4,7 @@
   "description": "Rolling in-memory buffer of a live Foxglove WebSocket connection, dumped to MCAP for full scrub-back. Poor-man's DVR for live data, no core app changes.",
   "publisher": "foxglove",
   "homepage": "",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "license": "UNLICENSED",
   "main": "./dist/extension.js",
   "keywords": ["dvr", "recording", "buffer", "mcap", "websocket", "live"],
