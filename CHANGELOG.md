@@ -1,5 +1,12 @@
 # DiyDvrExtension version history
 
+## 0.2.2
+
+- **Schema time field matches the data** — synthesized ROS2 schemas now declare the nanoseconds field as `nsec` (e.g. `header.stamp.nsec`), matching Foxglove's decoded message representation and its own `foxglove.*` schemas, instead of the ROS2 IDL name `nanosec`. The panel encodes the decoded object verbatim, so a saved MCAP's schema now agrees with its message data.
+- **Silent save no longer prompts** — write permission on the chosen directory is now requested at folder-pick time, inside the user gesture (later saves and auto-save rotations have no gesture, so the request would otherwise fail and fall back to the native Save dialog). A folder is only accepted once readwrite permission is granted.
+- **Grouped save-destination settings** — the settings sidebar now has a dedicated "Saving" node holding the Save folder display, the Choose-folder action, and Auto-save, so the picker sits with the controls it relates to rather than at the top of General. Budget mode / Lookback stay in General.
+- **Auto-save gated on a save folder** — Auto-save is only shown/enabled once a save folder is set, and the panel never sends `autoSave: true` to the worker without a folder, so a stale persisted flag can't trigger download-dialog rotations.
+
 ## 0.2.1
 
 - **Timeline keyed off published time** — the buffered/saved `logTime` now comes from the message's published time (falling back to receive time), so a saved MCAP's timestamps reflect the source clock. The ring buffer is kept sorted by `logTime`, so span reporting and oldest-first eviction stay correct even when a source delivers times out of order (e.g. a looping replay). "Budget used" is floored at zero and can never render negative.
