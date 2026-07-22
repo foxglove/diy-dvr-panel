@@ -225,8 +225,31 @@ async function writeMcapFile(
   return name;
 }
 
-/** Ensure read-write permission on the directory handle (may re-prompt across sessions). */
-async function ensureRwPermission(dirHandle: FileSystemDirectoryHandle): Promise<boolean> {
+// Chromium only grants requestPermission({mode:"readwrite"}) under transient
+// activation (a live user gesture), and it does not durably keep the grant:
+// IndexedDB-restored handles start at "prompt", and live grants lapse on
+// reload/focus-loss/inactivity. So permission is only ever *requested* from a real
+// gesture (button/toggle/settings action) via requestRwPermission; the async
+// worker "saved" callback — which has no gesture — only ever *queries* via
+// hasRwPermission. Requesting from the gesture-less callback would silently fail
+// and surprise the user with the native Save dialog.
+
+/** Query-only read-write permission check. Safe to call in any context (no gesture needed). */
+async function hasRwPermission(dirHandle: FileSystemDirectoryHandle): Promise<boolean> {
+  const handle = dirHandle as unknown as FileSystemHandlePermissions;
+  if (handle.queryPermission == undefined) {
+    return true; // permission API absent — attempt the write and let it throw if denied
+  }
+  const perm = await handle.queryPermission({ mode: "readwrite" });
+  return perm === "granted";
+}
+
+/**
+ * Query, then request read-write permission if not already granted. MUST be called
+ * from within a live user gesture (button onClick / settings action / toggle);
+ * requestPermission fails silently without transient activation.
+ */
+async function requestRwPermission(dirHandle: FileSystemDirectoryHandle): Promise<boolean> {
   const handle = dirHandle as unknown as FileSystemHandlePermissions;
   const opts: FsPermissionDescriptor = { mode: "readwrite" };
   if (handle.queryPermission == undefined) {
@@ -305,13 +328,22 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           }));
           const buffer = data.buffer;
           const dirHandle = dirHandleRef.current;
+          // Auto-save rotations have no user gesture, so permission is query-only
+          // here. Manual saves pre-acquire the grant inside the Save click gesture
+          // (see onSave), so by the time this callback runs the query succeeds.
+          const isRotation = data.rotation === true;
           void (async () => {
             if (canPickDir && dirHandle != undefined) {
               try {
-                const granted = await ensureRwPermission(dirHandle);
-                if (granted) {
+                if (await hasRwPermission(dirHandle)) {
                   const name = await writeMcapFile(buffer, dirHandle);
                   setLastSaveStatus(`Saved ${name} → ${dirHandle.name}`);
+                  return;
+                }
+                // Grant has lapsed. Never request (no gesture) and never surprise
+                // the user with the native dialog for an auto rotation.
+                if (isRotation) {
+                  setLastSaveStatus("Auto-save paused — click Save to re-grant folder access");
                   return;
                 }
                 const name = downloadMcap(buffer);
@@ -383,7 +415,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         // Request write permission NOW, inside the user gesture — later saves (and
         // auto-save rotations) have no gesture, so requestPermission would fail there
         // and fall back to the native download dialog.
-        const granted = await ensureRwPermission(handle);
+        const granted = await requestRwPermission(handle);
         if (!granted) {
           setLastSaveStatus("Folder not granted write permission — using browser download");
           return; // leave the previous handle / browser-download in place
@@ -401,8 +433,9 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     })();
   }, []);
 
-  // Revert to browser-download saves and forget the stored folder.
-  const useBrowserDownload = useCallback(() => {
+  // Revert to browser-download saves and forget the stored folder. (Not a hook —
+  // named without a "use" prefix so it can be called from the settings action.)
+  const selectBrowserDownload = useCallback(() => {
     dirHandleRef.current = undefined;
     setSaveFolderName(undefined);
     void clearDirHandle().catch((err: unknown) => {
@@ -471,16 +504,45 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   // Stable settings-editor action handler (reads latest config/topics via refs).
   const actionHandler = useCallback(
     (action: SettingsTreeAction) => {
-      // Button clicks arrive as perform-node-action — handle BEFORE any non-update bail.
-      if (action.action === "perform-node-action") {
-        if (action.payload.id === "chooseSaveFolder") {
-          chooseSaveFolder();
-        }
-        return;
-      }
       if (action.action !== "update") {
-        return; // ignore reorder-children / unknown actions (no throwing default)
+        return; // ignore node actions / reorder-children / unknown (no throwing default)
       }
+      const path = action.payload.path;
+
+      // "Save destination" select. A settings change is a user gesture, so opening
+      // the picker / requesting permission from here runs under transient activation.
+      if (path[0] === "saving" && path[1] === "saveDestination") {
+        const value = action.payload.value;
+        if (value === "choose") {
+          chooseSaveFolder();
+        } else if (value === "download") {
+          selectBrowserDownload();
+        }
+        return; // saveDestination is not persisted config
+      }
+
+      // Enabling auto-save is a gesture — pre-warm the RW grant so the gesture-less
+      // rotations start with a live grant instead of pausing on the first rotation.
+      if (path[0] === "saving" && path[1] === "autoSave" && action.payload.value === true) {
+        const dirHandle = dirHandleRef.current;
+        if (dirHandle != undefined) {
+          void (async () => {
+            const granted = await requestRwPermission(dirHandle);
+            if (!granted) {
+              setLastSaveStatus("Auto-save not enabled — folder write permission denied");
+              return; // don't enable without a live grant
+            }
+            const next = applyAction(configRef.current, action);
+            if (next === configRef.current) {
+              return;
+            }
+            setConfig(next);
+            context.saveState(next);
+          })();
+          return;
+        }
+      }
+
       const next = applyAction(configRef.current, action);
       if (next === configRef.current) {
         return; // unchanged
@@ -488,7 +550,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       setConfig(next);
       context.saveState(next);
     },
-    [context, chooseSaveFolder],
+    [context, chooseSaveFolder, selectBrowserDownload],
   );
 
   // (Re)render the settings editor on mount and whenever inputs change.
@@ -499,7 +561,19 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   }, [context, config, topics, saveFolderName, actionHandler]);
 
   const onSave = useCallback(() => {
-    workerRef.current?.postMessage({ type: "save" });
+    // The click gesture is live now but gone by the time the worker posts "saved",
+    // so acquire the RW grant here (query-then-request). The async "saved" handler
+    // then only queries and writes silently — deterministic, no native dialog.
+    void (async () => {
+      const dirHandle = dirHandleRef.current;
+      if (canPickDir && dirHandle != undefined) {
+        const granted = await requestRwPermission(dirHandle);
+        if (!granted) {
+          setLastSaveStatus("Folder write permission denied — saving as browser download");
+        }
+      }
+      workerRef.current?.postMessage({ type: "save" });
+    })();
   }, []);
 
   const onReset = useCallback(() => {
@@ -567,7 +641,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
               <ThemedButton theme={theme} variant="link" onClick={chooseSaveFolder}>
                 Change…
               </ThemedButton>
-              <ThemedButton theme={theme} variant="link" onClick={useBrowserDownload}>
+              <ThemedButton theme={theme} variant="link" onClick={selectBrowserDownload}>
                 Use browser download
               </ThemedButton>
             </div>
