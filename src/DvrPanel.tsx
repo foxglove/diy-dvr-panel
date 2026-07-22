@@ -75,7 +75,7 @@ function buttonStyle(
     fontSize: "0.8125rem",
     fontWeight: 500,
     lineHeight: 1.2,
-    borderRadius: 4,
+    borderRadius: 0,
     cursor: disabled ? "default" : "pointer",
     opacity: disabled ? 0.5 : 1,
     transition: "background 0.15s ease, color 0.15s ease",
@@ -610,6 +610,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         color: theme.fg,
       }}
     >
+      <p style={{ margin: "0 0 0.85rem", color: theme.muted, fontSize: "0.75rem" }}>
+        Topics, budget, and auto-save are in panel Settings (gear icon).
+      </p>
+
       <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.85rem" }}>
         <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onSave}>
           Save MCAP
@@ -619,37 +623,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         </ThemedButton>
       </div>
 
-      {canPickDir && (
-        <div style={{ marginBottom: "0.85rem" }}>
-          {saveFolderName == undefined ? (
-            <ThemedButton theme={theme} variant="primary" onClick={chooseSaveFolder}>
-              Choose save folder…
-            </ThemedButton>
-          ) : (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.4rem",
-                flexWrap: "wrap",
-              }}
-            >
-              <span style={{ color: theme.muted }}>Saving to</span>
-              <span style={{ color: theme.fg, fontWeight: 600, wordBreak: "break-all" }}>
-                {saveFolderName}
-              </span>
-              <ThemedButton theme={theme} variant="link" onClick={chooseSaveFolder}>
-                Change…
-              </ThemedButton>
-              <ThemedButton theme={theme} variant="link" onClick={selectBrowserDownload}>
-                Use browser download
-              </ThemedButton>
-            </div>
-          )}
-        </div>
-      )}
-
-      <div style={{ display: "grid", rowGap: "0.15rem", marginBottom: "0.85rem" }}>
+      <div style={{ display: "grid", rowGap: "0.15rem" }}>
         {statRows.map((row) => (
           <div
             key={row.label}
@@ -662,10 +636,6 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           </div>
         ))}
       </div>
-
-      <p style={{ margin: 0, color: theme.muted, fontSize: "0.75rem" }}>
-        Topics, budget, and auto-save are in panel Settings (gear icon).
-      </p>
     </div>
   );
 }

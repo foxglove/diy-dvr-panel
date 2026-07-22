@@ -1,5 +1,9 @@
 # DiyDvrExtension version history
 
+## 0.2.4
+
+- **Panel-body UI polish** — the save-folder picker now lives solely in the panel Settings "Save destination" select; the in-body "Choose save folder…" button and the Change / Use-browser-download links have been removed (the informational "Save destination" stats row stays). The "Topics, budget, and auto-save are in panel Settings (gear icon)" hint moves to the top of the body, above the button row, so it's the first thing a user sees. Buttons are now square (`borderRadius: 0`) to match Foxglove's UI, and the body reduces to a `Save MCAP` / `Reset buffer` row. No capture, worker, or permission behavior changed.
+
 ## 0.2.3
 
 - **Deterministic silent save** — the File System Access write-permission handshake is now only ever *requested* inside a live user gesture (the Save button click, the Auto-save toggle, or the "Save destination" settings action), and the gesture-less worker "saved" callback only ever *queries* the grant. Chromium only grants `requestPermission({mode:"readwrite"})` under transient activation and does not durably keep the grant, so requesting it from the async callback failed silently and fell back to the native Save dialog. Manual **Save** now acquires the grant inside the click and writes silently every time; the permission helper was split into `requestRwPermission` (gesture-only) and `hasRwPermission` (query-only).
