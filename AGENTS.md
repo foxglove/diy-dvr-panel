@@ -7,7 +7,7 @@ This repo is a single **Foxglove extension panel** ("DIY DVR"), written in TypeS
 ### What can and cannot run here
 - The **Foxglove app is external** and cannot run in this headless VM, so full GUI/E2E testing of the panel inside Foxglove is not possible here. Verify the two runnable halves of the product instead (below).
 - **Core writer path (offline, no browser):** `pnpm run validate:mcap /tmp/sample.mcap` exercises `buildMcap` + `schemaRegistry` + `inferSchema` and writes a real indexed MCAP. This is the best "does the product logic work" smoke test.
-- **Live `ws://` source harness:** `test-server/serve.py` replays an MCAP over a Foxglove WebSocket (default `ws://127.0.0.1:8767`, loops forever). It is the stand-in for a live robot feed that drives the panel. Run with `uv run test-server/serve.py --file <path.mcap>` (you can use the file produced by `validate:mcap`).
+- **Live `ws://` source harness:** `test-server/serve.py` replays an MCAP over a Foxglove WebSocket (default `ws://127.0.0.1:8765`, the standard Foxglove WS port, loops forever). It is the stand-in for a live robot feed that drives the panel. Run with `uv run test-server/serve.py --file <path.mcap>` (you can use the file produced by `validate:mcap`).
 
 ### Non-obvious gotchas
 - **WebSocket subprotocol:** `test-server` uses `foxglove-sdk>=0.4.0`, whose server negotiates the **`foxglove.sdk.v1`** subprotocol — NOT the older `foxglove.websocket.v1`. A client that only offers the old subprotocol gets an HTTP 400 handshake rejection.

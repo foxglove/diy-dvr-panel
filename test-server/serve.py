@@ -19,9 +19,9 @@ as a zero-install PEP 723 script and defaulted to a non-conflicting port.
 
 Usage (needs `uv`: https://docs.astral.sh/uv/):
     uv run serve.py --file path/to/recording.mcap
-    uv run serve.py --file rec.mcap --port 8767 --once
+    uv run serve.py --file rec.mcap --port 9000 --once   # override the default port
 
-Then point the Foxglove app (or the DIY DVR panel) at ws://127.0.0.1:8767.
+Then point the Foxglove app (or the DIY DVR panel) at ws://127.0.0.1:8765.
 """
 
 import argparse
@@ -35,9 +35,9 @@ import mcap.records
 from foxglove import Channel, Schema
 from foxglove.websocket import Capability, WebSocketServer
 
-# Default to 8767: the Foxglove app already listens on 8765 (the default Foxglove
-# WS port) locally, so bind elsewhere to avoid the conflict.
-DEFAULT_PORT = 8767
+# Default to 8765, the standard Foxglove WebSocket port: the app's "Open connection"
+# dialog defaults to it, so the app connects to this server with no extra config.
+DEFAULT_PORT = 8765
 
 channels: dict[str, Channel] = {}
 
