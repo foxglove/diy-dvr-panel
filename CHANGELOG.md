@@ -1,5 +1,9 @@
 # DiyDvrExtension version history
 
+## 0.2.5
+
+- **Customer-facing docs** — rewrote the README to be concise and user-focused (what it does, features, how to use) instead of implementation internals, since it renders in the app's Extensions view. Replaced the informal package `description` with professional copy.
+
 ## 0.2.4
 
 - **Panel-body UI polish** — the save-folder picker now lives solely in the panel Settings "Save destination" select; the in-body "Choose save folder…" button and the Change / Use-browser-download links have been removed (the informational "Save destination" stats row stays). The "Topics, budget, and auto-save are in panel Settings (gear icon)" hint moves to the top of the body, above the button row, so it's the first thing a user sees. Buttons are now square (`borderRadius: 0`) to match Foxglove's UI, and the body reduces to a `Save MCAP` / `Reset buffer` row. No capture, worker, or permission behavior changed.
