@@ -3,7 +3,7 @@
   "displayName": "DIY DVR",
   "description": "Rolling in-memory buffer of a live Foxglove WebSocket connection, dumped to MCAP for full scrub-back. Poor-man's DVR for live data, no core app changes.",
   "publisher": "foxglove",
-  "homepage": "",
+  "homepage": "https://github.com/foxglove/diy-dvr-panel",
   "version": "0.2.3",
   "license": "UNLICENSED",
   "main": "./dist/extension.js",

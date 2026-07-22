@@ -1,1 +1,6 @@
-Add your extension license here and update the package.json "license" field before publishing. License templates can be found at <https://github.com/licenses/license-templates>.
+Copyright (c) 2026 Foxglove. All rights reserved.
+
+This software is proprietary and confidential. It is provided to authorized
+recipients only and may not be copied, modified, distributed, or used except
+as expressly permitted in writing by Foxglove. No license, express or implied,
+is granted by making this software available.
