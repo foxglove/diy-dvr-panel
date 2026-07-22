@@ -380,6 +380,14 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
           }
         ).showDirectoryPicker();
+        // Request write permission NOW, inside the user gesture — later saves (and
+        // auto-save rotations) have no gesture, so requestPermission would fail there
+        // and fall back to the native download dialog.
+        const granted = await ensureRwPermission(handle);
+        if (!granted) {
+          setLastSaveStatus("Folder not granted write permission — using browser download");
+          return; // leave the previous handle / browser-download in place
+        }
         dirHandleRef.current = handle;
         setSaveFolderName(handle.name);
         try {
@@ -444,6 +452,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     if (!worker) {
       return;
     }
+    // Auto-save is only effective when a save folder is set; otherwise every rotation
+    // would dump to the native download dialog. Never send autoSave:true without a
+    // folder so a stale persisted flag can't trigger download-dialog rotations.
+    const autoSaveEffective = config.autoSave && saveFolderName != undefined;
     worker.postMessage({
       type: "config",
       budgetMode: config.budgetMode,
@@ -451,10 +463,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         config.budgetMode === "time" ? BigInt(Math.round(config.budgetValue * 1e9)) : undefined,
       budgetBytes:
         config.budgetMode === "bytes" ? Math.round(config.budgetValue * 1024 * 1024) : undefined,
-      autoSave: config.autoSave,
+      autoSave: autoSaveEffective,
       enabledTopics: enabledTopics.map((topic) => topic.name),
     });
-  }, [config, enabledTopics, workerReady]);
+  }, [config, enabledTopics, workerReady, saveFolderName]);
 
   // Stable settings-editor action handler (reads latest config/topics via refs).
   const actionHandler = useCallback(
