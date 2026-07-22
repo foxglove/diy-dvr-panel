@@ -1,6 +1,6 @@
 # test-server
 
-A faithful "poor man's live source": reads an MCAP and streams it over a Foxglove WebSocket, looping forever. Use it to drive the DIY DVR panel (or the app) without real hardware.
+A local live-source stand-in: reads an MCAP and streams it over a Foxglove WebSocket, looping forever. Use it to drive the DIY DVR panel (or the app) without real hardware.
 
 ## Fidelity
 
@@ -16,7 +16,7 @@ uv run serve.py --file rec.mcap --port 8767 --once     # play through once, then
 uv run serve.py --file rec.mcap --host 0.0.0.0         # expose on the network
 ```
 
-Port defaults to **8767** on purpose — 8765 (the Foxglove default) collides with the app.
+Defaults to port **8767** (override with `--port`). 8765 is the default Foxglove WebSocket port and the app already listens on it locally, so this server binds elsewhere to avoid the conflict.
 
 ## Connect
 

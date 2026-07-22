@@ -21,7 +21,7 @@ Usage (needs `uv`: https://docs.astral.sh/uv/):
     uv run serve.py --file path/to/recording.mcap
     uv run serve.py --file rec.mcap --port 8767 --once
 
-Then point the Foxglove app (or the DVR Spike panel) at ws://127.0.0.1:8767.
+Then point the Foxglove app (or the DIY DVR panel) at ws://127.0.0.1:8767.
 """
 
 import argparse
@@ -35,7 +35,8 @@ import mcap.records
 from foxglove import Channel, Schema
 from foxglove.websocket import Capability, WebSocketServer
 
-# Default to 8767, NOT 8765: the Foxglove default WS port collides with the app.
+# Default to 8767: the Foxglove app already listens on 8765 (the default Foxglove
+# WS port) locally, so bind elsewhere to avoid the conflict.
 DEFAULT_PORT = 8767
 
 channels: dict[str, Channel] = {}
