@@ -2,6 +2,7 @@
 
 ## 0.2.5
 
+- **Save-handler readability refactor** — the worker `"saved"` callback now delegates to a testable `persistCapture` helper (owns the "try folder → fall back to download" decision, query-only on permission) plus a pure `saveStatusText` mapper, flattening the previously nested async block. No behavior change.
 - **Customer-facing docs** — rewrote the README to be concise and user-focused (what it does, features, how to use) instead of implementation internals, since it renders in the app's Extensions view. Replaced the informal package `description` with professional copy.
 
 ## 0.2.4

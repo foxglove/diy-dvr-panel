@@ -262,6 +262,56 @@ async function requestRwPermission(dirHandle: FileSystemDirectoryHandle): Promis
   return perm === "granted";
 }
 
+type SaveResult =
+  | { mode: "folder"; name: string; folder: string }
+  | { mode: "paused" }
+  | { mode: "download"; name: string; reason?: "denied" | "error"; error?: string };
+
+/**
+ * Decide where the freshly-sealed MCAP goes and perform the write/download.
+ * Query-only on permission (safe in the gesture-less "saved" callback) — a lapsed
+ * grant on a rotation pauses instead of surprising the user with the native dialog.
+ */
+async function persistCapture(
+  buffer: ArrayBuffer,
+  dirHandle: FileSystemDirectoryHandle | undefined,
+  trigger: "manual" | "rotation",
+): Promise<SaveResult> {
+  if (!canPickDir || dirHandle == undefined) {
+    return { mode: "download", name: downloadMcap(buffer) };
+  }
+  try {
+    if (await hasRwPermission(dirHandle)) {
+      const name = await writeMcapFile(buffer, dirHandle);
+      return { mode: "folder", name, folder: dirHandle.name };
+    }
+    // Grant lapsed. Never request (no gesture). Rotations pause; manual saves download.
+    if (trigger === "rotation") {
+      return { mode: "paused" };
+    }
+    return { mode: "download", name: downloadMcap(buffer), reason: "denied" };
+  } catch (err) {
+    return { mode: "download", name: downloadMcap(buffer), reason: "error", error: String(err) };
+  }
+}
+
+function saveStatusText(result: SaveResult): string {
+  switch (result.mode) {
+    case "folder":
+      return `Saved ${result.name} → ${result.folder}`;
+    case "paused":
+      return "Auto-save paused — click Save to re-grant folder access";
+    case "download":
+      if (result.reason === "denied") {
+        return `Permission denied — downloaded ${result.name}`;
+      }
+      if (result.reason === "error") {
+        return `Write failed (${result.error ?? ""}) — downloaded ${result.name}`;
+      }
+      return `Downloaded ${result.name}`;
+  }
+}
+
 function statSummary(stat: WorkerStat, config: DvrConfig): { used: string; cap: string } {
   if (config.budgetMode === "time") {
     const spanNanos = BigInt(stat.newestNanos) - BigInt(stat.oldestNanos);
@@ -331,33 +381,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           // Auto-save rotations have no user gesture, so permission is query-only
           // here. Manual saves pre-acquire the grant inside the Save click gesture
           // (see onSave), so by the time this callback runs the query succeeds.
-          const isRotation = data.rotation === true;
-          void (async () => {
-            if (canPickDir && dirHandle != undefined) {
-              try {
-                if (await hasRwPermission(dirHandle)) {
-                  const name = await writeMcapFile(buffer, dirHandle);
-                  setLastSaveStatus(`Saved ${name} → ${dirHandle.name}`);
-                  return;
-                }
-                // Grant has lapsed. Never request (no gesture) and never surprise
-                // the user with the native dialog for an auto rotation.
-                if (isRotation) {
-                  setLastSaveStatus("Auto-save paused — click Save to re-grant folder access");
-                  return;
-                }
-                const name = downloadMcap(buffer);
-                setLastSaveStatus(`Permission denied — downloaded ${name}`);
-                return;
-              } catch (err) {
-                const name = downloadMcap(buffer);
-                setLastSaveStatus(`Write failed (${String(err)}) — downloaded ${name}`);
-                return;
-              }
-            }
-            const name = downloadMcap(buffer);
-            setLastSaveStatus(`Downloaded ${name}`);
-          })();
+          const trigger = data.rotation === true ? "rotation" : "manual";
+          void persistCapture(buffer, dirHandle, trigger).then((result) => {
+            setLastSaveStatus(saveStatusText(result));
+          });
           break;
         }
         case "error":
