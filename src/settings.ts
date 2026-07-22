@@ -81,28 +81,48 @@ export function buildSettingsTree(
         value: config.budgetValue,
         min: 0,
       },
-      autoSave: {
-        label: "Auto-save on rotation",
-        input: "boolean",
-        value: config.autoSave,
-      },
-      saveFolder: {
-        label: "Save folder",
-        input: "string",
-        value: opts?.saveFolderName ?? "Browser download",
-        readonly: true,
-      },
     },
   };
 
+  const folderIsSet = opts?.saveFolderName != undefined;
+
+  // Group the save-destination controls together: the Save folder display, the
+  // Choose-folder affordance, and (only once a folder is set) Auto-save. Rendering
+  // Auto-save without a folder would dump every rotation to the native download
+  // dialog, so gate it on a folder being chosen.
+  const savingFields: SettingsTreeFields = {
+    saveFolder: {
+      label: "Save folder",
+      input: "string",
+      value: opts?.saveFolderName ?? "Browser download",
+      readonly: true,
+    },
+  };
+  if (folderIsSet) {
+    savingFields.autoSave = {
+      label: "Auto-save on rotation",
+      input: "boolean",
+      value: config.autoSave,
+    };
+  }
+
+  const saving: SettingsTreeNode = {
+    label: "Saving",
+    fields: savingFields,
+  };
+
   if (opts?.canPickDir === true) {
-    // Short single-line label so it fits inline in the node header (the full "Choose
-    // save folder…" wrapped awkwardly). The in-panel body offers the same picker.
-    general.actions = [
+    // The choose action lives on the Saving node so it renders next to the
+    // Save-folder / Auto-save controls it relates to. Short single-line label so
+    // it fits inline in the node header. The in-panel body offers the same picker.
+    saving.actions = [
       { type: "action", id: "chooseSaveFolder", label: "Choose folder…", display: "inline" },
     ];
+    if (!folderIsSet) {
+      saving.help = "Set a save folder to enable auto-save.";
+    }
   } else {
-    general.help =
+    saving.help =
       "Silent save requires a Chromium-based build (Chrome/Edge desktop or web). Files will download instead.";
   }
 
@@ -115,6 +135,7 @@ export function buildSettingsTree(
   return {
     nodes: {
       general,
+      saving,
       topics: topicsNode,
     },
     actionHandler,
@@ -149,6 +170,10 @@ export function applyAction(config: DvrConfig, action: SettingsTreeAction): DvrC
       }
       return { ...config, budgetValue: next };
     }
+    return config;
+  }
+
+  if (path[0] === "saving") {
     if (path[1] === "autoSave") {
       const next = Boolean(value);
       if (next === config.autoSave) {
