@@ -1,0 +1,12 @@
+[project]
+name = "demo-server"
+version = "0.0.1"
+description = "Foxglove WS server: a warehouse robot driving dock-to-dock with random faults, for the DIY DVR panel demo"
+requires-python = ">=3.10"
+dependencies = [
+    "foxglove-sdk>=0.4.0",
+    "numpy>=2.0",
+]
+
+[tool.uv]
+package = false

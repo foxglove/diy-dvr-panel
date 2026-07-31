@@ -1,0 +1,5 @@
+# Python / uv artifacts
+.venv/
+__pycache__/
+*.pyc
+.logs/

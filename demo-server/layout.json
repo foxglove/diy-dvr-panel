@@ -1,0 +1,134 @@
+{
+  "configById": {
+    "3D!main": {
+      "cameraState": {
+        "distance": 34,
+        "perspective": true,
+        "phi": 52,
+        "target": [10, 8, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "thetaOffset": 0,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "scene": {
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 1
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/map": { "visible": true },
+        "/scene": { "visible": true },
+        "/plan": { "visible": true },
+        "/robot/pose": { "visible": true },
+        "/odom": { "visible": false }
+      },
+      "layers": {
+        "grid": {
+          "visible": true,
+          "drawBehind": true,
+          "instanceId": "grid-floor",
+          "layerId": "foxglove.Grid",
+          "size": 24,
+          "divisions": 24,
+          "lineWidth": 1,
+          "color": "#2a2a33",
+          "position": [10, 8, 0],
+          "rotation": [0, 0, 0]
+        }
+      },
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "synchronize": false,
+      "imageMode": {}
+    },
+    "StateTransitions!status": {
+      "paths": [
+        {
+          "value": "/status.state",
+          "timestampMethod": "receiveTime",
+          "label": "state"
+        }
+      ],
+      "isSynced": true
+    },
+    "RosOut!diagnostics": {
+      "topicToRender": "/diagnostics",
+      "minLogLevel": 1,
+      "searchTerms": []
+    },
+    "Plot!imu": {
+      "title": "IMU linear acceleration (m/s^2)",
+      "paths": [
+        { "value": "/imu.linear_acceleration.x", "enabled": true, "label": "accel x", "timestampMethod": "receiveTime", "color": "#ff5252" },
+        { "value": "/imu.linear_acceleration.y", "enabled": true, "label": "accel y", "timestampMethod": "receiveTime", "color": "#52ff52" },
+        { "value": "/imu.linear_acceleration.z", "enabled": true, "label": "accel z", "timestampMethod": "receiveTime", "color": "#52a8ff" }
+      ],
+      "minYValue": "",
+      "maxYValue": "",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 240
+    },
+    "Plot!battery": {
+      "title": "Battery",
+      "paths": [
+        { "value": "/battery.percentage", "enabled": true, "label": "percentage (%)", "timestampMethod": "receiveTime", "color": "#52ff52" },
+        { "value": "/battery.voltage", "enabled": true, "label": "voltage (V)", "timestampMethod": "receiveTime", "color": "#ffb852" }
+      ],
+      "minYValue": "",
+      "maxYValue": "",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 240
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "column",
+    "first": "3D!main",
+    "second": {
+      "direction": "column",
+      "first": {
+        "direction": "row",
+        "first": "StateTransitions!status",
+        "second": "RosOut!diagnostics",
+        "splitPercentage": 50
+      },
+      "second": {
+        "direction": "row",
+        "first": "Plot!imu",
+        "second": "Plot!battery",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 45
+    },
+    "splitPercentage": 55
+  }
+}
