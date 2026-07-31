@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run lint:ci
+
+      - run: pnpm run typecheck
+
+      # Packaging is the artifact the extension registry consumes, so a broken
+      # package is a broken release. Build it on every PR rather than finding
+      # out at tag time.
+      - run: pnpm run package
+
+      # The registry pins an exact sha256sum, so packaging must be
+      # byte-reproducible. Guards scripts/normalize-foxe.mjs against regressions
+      # in create-foxglove-extension's zip timestamping.
+      - name: Check packaging is byte-reproducible
+        run: |
+          FIRST_SHA=$(sha256sum ./*.foxe | cut -d' ' -f1)
+          rm -rf dist src/generatedWorkerSource.ts ./*.foxe
+          pnpm run package
+          SECOND_SHA=$(sha256sum ./*.foxe | cut -d' ' -f1)
+          if [ "$FIRST_SHA" != "$SECOND_SHA" ]; then
+            echo "Packaging is not reproducible: $FIRST_SHA vs $SECOND_SHA" >&2
+            exit 1
+          fi
+          echo "Reproducible: $FIRST_SHA"
+
+      # Exercises buildMcap + schemaRegistry + inferSchema and writes a real
+      # indexed MCAP. The panel itself needs the Foxglove app, which cannot run
+      # here, so this is the closest thing to an end-to-end check.
+      - run: pnpm run validate:mcap /tmp/ci-sample.mcap

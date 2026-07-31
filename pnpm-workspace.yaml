@@ -1,3 +1,11 @@
 # Standalone repo root. This empty workspace file stops pnpm from walking up
 # into a parent workspace (e.g. when this repo lives nested under another).
 packages: []
+# pnpm >=10 no longer reads `node-linker` from .npmrc. The webpack build in
+# create-foxglove-extension resolves loaders (ts-loader) from the repo root,
+# so the hoisted layout is required.
+nodeLinker: hoisted
+allowBuilds:
+  esbuild: true
+overrides:
+  eslint-plugin-import: 2.32.0

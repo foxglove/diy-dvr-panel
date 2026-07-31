@@ -1,5 +1,12 @@
 # DiyDvrExtension version history
 
+## 0.2.6
+
+- **MIT licensed.** Replaces the previous proprietary "all rights reserved" LICENSE, so the extension can be distributed through the public [Foxglove extension registry](https://github.com/foxglove/extension-registry). Matches the other Foxglove-published registry entries.
+- **Reproducible packaging.** `pnpm run package` now normalizes zip timestamps so a given source tree always produces a byte-identical `.foxe`. The registry pins an exact `sha256sum` per release, and `foxglove-extension package` was stamping the auto-created `dist/` folder entry with the build wall-clock time, so two builds of identical sources hashed differently.
+- **CI and release automation.** Pull requests now run lint, typecheck, packaging, the offline MCAP writer check, and a reproducibility check. Tagging `v*` builds the `.foxe`, attaches it to the release, and emits the ready-to-paste `extensions.json` entry for the registry.
+- **Housekeeping.** Added `repository` / `bugs` metadata, pinned the package manager, moved pnpm settings out of the `package.json` `pnpm` field (ignored by pnpm >=10) into `pnpm-workspace.yaml` so the `eslint-plugin-import` override applies again, and removed the `pretest` script, which called a `foxglove-extension` subcommand that does not exist.
+
 ## 0.2.5
 
 - **Save-handler readability refactor** — the worker `"saved"` callback now delegates to a testable `persistCapture` helper (owns the "try folder → fall back to download" decision, query-only on permission) plus a pure `saveStatusText` mapper, flattening the previously nested async block. No behavior change.

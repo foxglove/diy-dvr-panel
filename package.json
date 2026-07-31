@@ -4,21 +4,28 @@
   "description": "Save data from a live Foxglove WebSocket connection to disk from a panel. Keep a rolling time- or size-bounded buffer and dump it to MCAP on demand, or auto-save each window as the limit is reached, then re-open the file for full scrub-back.",
   "publisher": "foxglove",
   "homepage": "https://github.com/foxglove/diy-dvr-panel",
-  "version": "0.2.5",
-  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/foxglove/diy-dvr-panel.git"
+  },
+  "bugs": "https://github.com/foxglove/diy-dvr-panel/issues",
+  "version": "0.2.6",
+  "license": "MIT",
   "main": "./dist/extension.js",
   "keywords": ["dvr", "recording", "buffer", "mcap", "websocket", "live"],
+  "packageManager": "pnpm@11.18.0",
   "scripts": {
     "bundle:worker": "node scripts/bundle-worker.mjs",
     "build": "node scripts/bundle-worker.mjs && foxglove-extension build",
     "foxglove:prepublish": "node scripts/bundle-worker.mjs && foxglove-extension build --mode production",
     "validate:mcap": "node scripts/validate-mcap.mjs",
+    "typecheck": "node scripts/bundle-worker.mjs && tsc --noEmit",
     "lint": "eslint .",
     "lint:ci": "eslint .",
     "lint:fix": "eslint --fix .",
     "local-install": "node scripts/bundle-worker.mjs && foxglove-extension install",
-    "package": "foxglove-extension package",
-    "pretest": "foxglove-extension pretest"
+    "package": "foxglove-extension package && node scripts/normalize-foxe.mjs",
+    "registry-entry": "foxglove-extension publish"
   },
   "devDependencies": {
     "@foxglove/eslint-plugin": "2.1.0",
@@ -38,11 +45,5 @@
     "@foxglove/schemas": "^2.1.0",
     "@mcap/core": "^2.2.1",
     "esbuild": "^0.24.2"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"],
-    "overrides": {
-      "eslint-plugin-import": "2.32.0"
-    }
   }
 }
