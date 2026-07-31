@@ -6,8 +6,6 @@ enough (a few thousand cells, 8-connected) to replan synchronously on the tick
 that a goal changes or a recovery kicks in.
 """
 
-from __future__ import annotations
-
 import heapq
 import math
 
@@ -23,6 +21,10 @@ from world import (
 )
 
 _NEIGHBORS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+# A* step penalty per unit of normalized costmap cost, so the path holds aisle
+# centerlines instead of grazing the inflated edges of obstacles.
+CLEARANCE_PENALTY = 6.0
 
 
 def _passable(cost: np.ndarray, col: int, row: int) -> bool:
@@ -48,7 +50,7 @@ def _line_clear(
     cost: np.ndarray,
     a: tuple[int, int],
     b: tuple[int, int],
-    threshold: int = BLOCK_THRESHOLD,
+    threshold: int,
 ) -> bool:
     """Bresenham line-of-sight test: every cell on the line has cost < threshold."""
     (c0, r0), (c1, r1) = a, b
@@ -128,7 +130,7 @@ def plan_path(
             # Strongly bias away from inflation halos so the path holds aisle
             # centerlines instead of grazing rack edges (a small penalty here
             # let the path hug obstacles and the robot body clipped them).
-            step += (cost[nr, nc] / 100.0) * 6.0
+            step += (cost[nr, nc] / 100.0) * CLEARANCE_PENALTY
             ng = g[cur] + step
             nxt = (nc, nr)
             if ng < g.get(nxt, float("inf")):

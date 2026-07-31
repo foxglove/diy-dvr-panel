@@ -11,8 +11,6 @@ The machine owns only the discrete mode + timers; the main loop reads
 the State Transitions panel legible when read cold.
 """
 
-from __future__ import annotations
-
 from enum import Enum
 
 

@@ -7,8 +7,6 @@ the grid pose sits at (MIN_X, MIN_Y) and the buffer streams out directly with
 Grid schema: https://docs.foxglove.dev/docs/visualization/message-schemas/grid
 """
 
-from __future__ import annotations
-
 import numpy as np
 from foxglove.messages import (
     Grid,
@@ -21,16 +19,14 @@ from foxglove.messages import (
 )
 
 from lib.geometry import IDENTITY_QUAT
-from world import CELL, COLS, MIN_X, MIN_Y
-
-FRAME = "map"
+from world import CELL, COLS, MAP_FRAME, MIN_X, MIN_Y
 
 
 def build_grid(costmap: np.ndarray, timestamp: Timestamp) -> Grid:
     data = np.ascontiguousarray(costmap, dtype=np.uint8).tobytes()
     return Grid(
         timestamp=timestamp,
-        frame_id=FRAME,
+        frame_id=MAP_FRAME,
         pose=Pose(
             position=Vector3(x=MIN_X, y=MIN_Y, z=0.0),
             orientation=IDENTITY_QUAT,

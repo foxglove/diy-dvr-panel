@@ -8,8 +8,6 @@ Frames:
 Schema refs: https://docs.foxglove.dev/docs/visualization/message-schemas
 """
 
-from __future__ import annotations
-
 import math
 
 from foxglove.messages import (
@@ -30,10 +28,7 @@ from foxglove.messages import (
 
 from lib.geometry import IDENTITY_QUAT, yaw_to_quaternion
 from robot import RobotState
-from world import Waypoint
-
-MAP_FRAME = "map"
-BODY_FRAME = "base_link"
+from world import BODY_FRAME, MAP_FRAME, Waypoint
 
 _BODY_COLOR = Color(r=0.20, g=0.55, b=0.95, a=1.0)
 _HEADING_COLOR = Color(r=1.0, g=1.0, b=1.0, a=1.0)

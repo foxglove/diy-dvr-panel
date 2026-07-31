@@ -15,13 +15,11 @@ Usage:
 Foxglove SDK reference: https://docs.foxglove.dev/docs/sdk
 """
 
-from __future__ import annotations
-
 import logging
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # Ensure sibling modules + `lib.geometry` resolve regardless of the cwd used to
@@ -57,11 +55,9 @@ from robot import step as robot_step
 from schemas import BATTERY_SCHEMA, IMU_SCHEMA, STATUS_SCHEMA
 from sensors import Battery, imu_reading
 from state_machine import LOW_BATTERY_PCT, Mission, State
-from world import WAYPOINTS, Waypoint, World, build_world
+from world import BODY_FRAME, MAP_FRAME, WAYPOINTS, Waypoint, World, build_world
 from planner import plan_path
 
-MAP_FRAME = "map"
-BODY_FRAME = "base_link"
 CHARGING_BAY = "charging bay"
 MAP_PUBLISH_PERIOD_S = 1.0
 
@@ -86,7 +82,16 @@ class Simulation:
     battery: Battery = field(init=False)
     robot: RobotState = field(init=False)
     goal: Waypoint = field(init=False)
+    goal_index: int = field(init=False)
     path: list[tuple[float, float]] = field(init=False)
+    prev_v: float = field(init=False)
+    at_goal: bool = field(init=False)
+    at_charger: bool = field(init=False)
+    dynamic_obstacles: list[tuple[float, float, float]] = field(init=False)
+    last_event: FaultEvent | None = field(init=False)
+    imu: dict[str, object] = field(init=False)
+    battery_msg: dict[str, object] = field(init=False)
+    _prev_state: State = field(init=False)
 
     def __post_init__(self) -> None:
         self.dt = 1.0 / self.rate_hz
@@ -107,13 +112,13 @@ class Simulation:
         self.prev_v = 0.0
         self.at_goal = False
         self.at_charger = False
-        self.dynamic_obstacles: list[tuple[float, float, float]] = []
-        self.last_event: FaultEvent | None = None
+        self.dynamic_obstacles = []
+        self.last_event = None
         self._prev_state = self.mission.state
 
         # Message-ready sensor snapshots.
-        self.imu: dict[str, object] = {}
-        self.battery_msg: dict[str, object] = {}
+        self.imu = {}
+        self.battery_msg = {}
 
     def _pick_goal(self, battery_pct: float) -> Waypoint:
         """Next goal: charging bay when low, else cycle waypoints (skip current)."""
@@ -139,7 +144,11 @@ class Simulation:
             path=self.path,
         )
         event = self.injector.update(ctx)
-        if event is not None:
+        # Only error-level faults (a blocking obstacle) trip the mission into
+        # ERROR and force a replan. Warning-level faults (motor stall, IMU tilt,
+        # battery sag, pose jump) perturb the live signals while the robot keeps
+        # driving, so each shows a distinct on-screen effect.
+        if event is not None and event.level == "error":
             self.mission.trip_fault(event.message)
         self.last_event = event
 
@@ -184,7 +193,12 @@ class Simulation:
             )
             self.at_goal = False
             self.at_charger = False
-            self.mission.start_driving(f"en route to {self.goal.name}")
+            if self.path:
+                self.mission.start_driving(f"en route to {self.goal.name}")
+            else:
+                # No route to this goal — bail to ERROR so RECOVERING re-picks
+                # another, instead of dead-sticking in DRIVING on an empty path.
+                self.mission.trip_fault(f"no route to {self.goal.name}")
 
         # 5. Drive.
         self.prev_v = self.robot.v
@@ -194,6 +208,10 @@ class Simulation:
             )
             self.at_goal = reached
             self.at_charger = reached and self.goal.name == CHARGING_BAY
+        else:
+            # Parked in a non-driving state: zero the body twist so /odom agrees
+            # with the frozen pose instead of reporting the last driving velocity.
+            self.robot = replace(self.robot, v=0.0, w=0.0)
 
         # 6. Sensors.
         self.imu = imu_reading(

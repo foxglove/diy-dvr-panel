@@ -4,8 +4,6 @@ Deliberately small: Euler->quaternion in the SDK's Quaternion type and
 Timestamp constructors. Harvested from the water-turbulence-sim experiments.
 """
 
-from __future__ import annotations
-
 import datetime
 import math
 

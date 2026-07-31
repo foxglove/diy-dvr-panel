@@ -5,8 +5,6 @@ by name. Faults perturb these through explicit arguments (tilt/accel spike,
 battery sag) rather than reaching into internal state.
 """
 
-from __future__ import annotations
-
 import math
 import random
 from dataclasses import dataclass

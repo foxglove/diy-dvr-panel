@@ -5,8 +5,6 @@ return and what `main.py` publishes on `/status`, so a Plot panel can address
 each scalar by name (e.g. `/imu.linear_acceleration.x`).
 """
 
-from __future__ import annotations
-
 _NUMBER = {"type": "number"}
 
 

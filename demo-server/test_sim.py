@@ -7,8 +7,6 @@ robot moves, the battery drains while driving, a fault fires early, and the
 mission visits both DRIVING and ERROR.
 """
 
-from __future__ import annotations
-
 import math
 import sys
 from pathlib import Path
@@ -77,7 +75,7 @@ def test_sim_run() -> None:
     assert first_fault_at is not None, "no fault fired in 30 s"
     assert first_fault_at <= 25.0, f"first fault too late: t={first_fault_at:.2f}"
     assert State.DRIVING in states_seen, "mission never reached DRIVING"
-    assert State.ERROR in states_seen, "mission never reached ERROR"
+    assert State.GOAL_REACHED in states_seen, "mission never completed a goal"
 
     print(f"  robot moved {start_xy} -> ({end_xy[0]:.2f}, {end_xy[1]:.2f}) OK")
     print(f"  battery drained to {sim.battery.percentage:.2f}% "
@@ -154,6 +152,114 @@ def test_robot_stays_out_of_racks() -> None:
     print(f"  robot body cleared all racks (worst footprint cost {worst}) OK")
 
 
+def test_obstacle_blocking_lands_ahead_of_robot() -> None:
+    """Regression: the blocker drops ahead of the ROBOT, not the path start.
+
+    The old bug walked from `path[0]`, so with the robot most of the way down a
+    path the blocker landed far behind it and the "route around it" beat never
+    happened.
+    """
+    import random
+
+    from faults import BLOCKER_AHEAD_M, FaultContext, FaultInjector, FaultKind
+
+    inj = FaultInjector(random.Random(0), start_time=0.0)
+    path = [(0.0, 0.0), (10.0, 0.0)]  # straight 10 m path
+    robot_xy = (6.0, 0.0)  # robot is 6 m along it, well past the start
+    inj._fire(FaultKind.OBSTACLE_BLOCKING, FaultContext(0.0, robot_xy, 0.0, path))
+    bx, by, _ = inj.pert.blocker
+
+    assert abs(bx - (robot_xy[0] + BLOCKER_AHEAD_M)) < 1e-6, f"blocker x={bx}"
+    assert abs(by) < 1e-6
+    # The old placement would sit ~BLOCKER_AHEAD_M from path[0]; guard against it.
+    assert math.hypot(bx - path[0][0], by - path[0][1]) > BLOCKER_AHEAD_M
+    print("  obstacle_blocking lands ahead of the robot, not the path start OK")
+
+
+def test_motor_stall_is_warning_and_decelerates() -> None:
+    """Regression: motor_stall's speed_scale actually slows the follower.
+
+    It was dead: motor_stall tripped ERROR, so the robot wasn't driving and never
+    read speed_scale. It's now a warning that decelerates the follower to a stop.
+    """
+    import random
+
+    from faults import FaultContext, FaultInjector, FaultKind
+    from robot import RobotState, step
+
+    inj = FaultInjector(random.Random(0), start_time=0.0)
+    ev = inj._fire(FaultKind.MOTOR_STALL, FaultContext(0.0, (0.0, 0.0), 0.0, [(0.0, 0.0), (10.0, 0.0)]))
+    assert ev.level == "warning", f"motor_stall level {ev.level!r}"
+    assert inj.pert.speed_scale == 0.0
+
+    st = RobotState(x=2.0, y=0.0, yaw=0.0, v=1.2, w=0.0)
+    for _ in range(100):
+        st, _ = step(st, [(0.0, 0.0), (10.0, 0.0)], 0.05, speed_scale=0.0)
+    assert st.v < 0.05, f"stall did not decelerate the follower: v={st.v}"
+    print("  motor_stall is a warning that decelerates the follower OK")
+
+
+def test_plan_path_returns_empty_when_unreachable() -> None:
+    """A goal walled off from the start yields no path (not a corner-squeeze)."""
+    import numpy as np
+
+    from planner import plan_path
+    from world import CELL, COLS, LETHAL, MIN_X, MIN_Y, ROWS
+
+    cost = np.zeros((ROWS, COLS), np.uint8)
+    cost[:, COLS // 2] = LETHAL  # full-height wall splits the floor
+    left = (MIN_X + 2 * CELL, MIN_Y + 2 * CELL)
+    right = (MIN_X + (COLS - 2) * CELL, MIN_Y + 2 * CELL)
+    assert plan_path(cost, left, right) == [], "expected no path across a solid wall"
+    print("  plan_path returns [] across a full-height wall OK")
+
+
+def test_unreachable_goal_does_not_deadstick() -> None:
+    """Regression: an empty plan must not park the robot in DRIVING forever.
+
+    With half the floor walled off, some waypoints are unreachable; the mission
+    must bail to recovery rather than sit in DRIVING on an empty path.
+    """
+    from state_machine import State
+    from world import COLS, LETHAL
+
+    sim = Simulation(seed=0, rate_hz=20.0)
+    # Wall the *static* cost (dynamic cost is wiped on every GOAL_REACHED), so
+    # the right-half waypoints stay unreachable for the whole run.
+    sim.world.static_cost[:, COLS // 2] = LETHAL
+
+    saw_recovery = False
+    for i in range(int(60.0 * 20.0)):
+        sim.tick(i * sim.dt)
+        if sim.mission.is_driving:
+            assert sim.path, f"driving with an empty path at tick {i} (dead-stick)"
+        if sim.mission.state in (State.ERROR, State.RECOVERING):
+            saw_recovery = True
+
+    assert saw_recovery, "expected ERROR/RECOVERING when a goal is unreachable"
+    print("  unreachable goal recovers instead of dead-sticking in DRIVING OK")
+
+
+def test_odom_twist_zero_when_not_driving() -> None:
+    """Regression: body twist is zeroed whenever the robot isn't driving.
+
+    Odom used to keep publishing the last driving velocity while the pose was
+    frozen in ERROR, so twist and pose disagreed during an incident.
+    """
+    saw_stopped = False
+    sim = Simulation(seed=0, rate_hz=20.0)
+    for i in range(int(120.0 * 20.0)):
+        sim.tick(i * sim.dt)
+        if not sim.mission.is_driving:
+            assert sim.robot.v == 0.0 and sim.robot.w == 0.0, (
+                f"nonzero twist while not driving at tick {i}: "
+                f"v={sim.robot.v}, w={sim.robot.w}"
+            )
+            saw_stopped = True
+    assert saw_stopped, "never observed a non-driving tick"
+    print("  /odom twist is zero whenever the robot is not driving OK")
+
+
 def test_message_builders() -> None:
     """Construct + encode every Foxglove message from a stepped sim state.
 
@@ -205,6 +311,11 @@ def main() -> None:
     test_sim_run()
     test_low_battery_docks_and_recovers()
     test_robot_stays_out_of_racks()
+    test_obstacle_blocking_lands_ahead_of_robot()
+    test_motor_stall_is_warning_and_decelerates()
+    test_plan_path_returns_empty_when_unreachable()
+    test_unreachable_goal_does_not_deadstick()
+    test_odom_twist_zero_when_not_driving()
     test_message_builders()
     print("ALL TESTS PASSED")
 

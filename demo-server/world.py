@@ -9,11 +9,13 @@ costmap origin (cell 0,0) sits at (MIN_X, MIN_Y); cell (col, row) spans
 [MIN_X + col*CELL .. ] on x and [MIN_Y + row*CELL .. ] on y.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 import numpy as np
+
+# Frame ids used across the demo; /tf publishes MAP_FRAME -> BODY_FRAME.
+MAP_FRAME = "map"
+BODY_FRAME = "base_link"
 
 # ---- Floor extent (meters) ------------------------------------------------
 MIN_X, MAX_X = 0.0, 20.0

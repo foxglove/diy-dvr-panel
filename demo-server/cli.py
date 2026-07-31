@@ -1,7 +1,5 @@
 """CLI parsing for the factory-nav demo server."""
 
-from __future__ import annotations
-
 import argparse
 
 DEFAULT_RATE_HZ = 20.0
@@ -42,4 +40,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="RNG seed for fault timing + sensor noise (deterministic runs).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.rate_hz <= 0:
+        parser.error("--rate-hz must be greater than 0")
+    return args
