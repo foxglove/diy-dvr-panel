@@ -65,6 +65,10 @@ entry and made every build hash differently. The normalize script rewrites the
 DOS date/time fields of every entry, in both the local file headers and the
 central directory, without touching any compressed stream.
 
-Reproducibility holds for a given toolchain; a different Node or OS may produce
-different webpack output. Always take the registry `sha256sum` from the release
-job, never from a local rebuild.
+Reproducibility has been verified across toolchains: the same commit packaged on
+macOS / Node 24 and on `ubuntu-24.04` / Node 22 produced an identical
+`sha256sum`. CI also rebuilds and compares hashes on every pull request.
+
+Still take the registry `sha256sum` from the release job rather than a local
+rebuild, since that is the hash of the artifact actually published, and any
+change to `package.json`, `README.md`, `CHANGELOG.md`, or `dist/` changes it.
