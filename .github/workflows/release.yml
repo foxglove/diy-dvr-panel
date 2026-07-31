@@ -1,0 +1,111 @@
+name: Release
+
+# Builds the .foxe, attaches it to the release, and prints the ready-to-paste
+# extensions.json entry for https://github.com/foxglove/extension-registry.
+#
+# The registry pins an exact sha256sum per release, so `pnpm run package`
+# normalizes zip timestamps (see scripts/normalize-foxe.mjs) to make the .foxe
+# byte-reproducible. This job still cross-checks the hash of the uploaded asset
+# against the artifact it built, so a bad upload cannot pin an unverifiable hash.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach the .foxe to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      # github.event.inputs is always readable (null on a tag push), whereas the
+      # `inputs` context only exists for workflow_dispatch.
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Check tag matches package.json version
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          if [ "$TAG" != "v$PKG_VERSION" ]; then
+            echo "Tag $TAG does not match package.json version $PKG_VERSION (expected v$PKG_VERSION)" >&2
+            exit 1
+          fi
+
+      - run: pnpm run lint:ci
+
+      - run: pnpm run typecheck
+
+      - name: Package extension
+        run: |
+          pnpm run package
+          # create-foxglove-extension writes exactly one <publisher>.<name>-<version>.foxe
+          # at the repo root, and .foxe is gitignored, so the checkout has no others.
+          count=$(ls -1 ./*.foxe 2>/dev/null | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly one .foxe at the repo root, found $count" >&2
+            exit 1
+          fi
+          FOXE=$(ls -1 ./*.foxe)
+          echo "FOXE=$FOXE" >> "$GITHUB_ENV"
+          echo "LOCAL_SHA=$(sha256sum "$FOXE" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Upload .foxe to the release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" "$FOXE" --clobber
+
+      - name: Generate extensions.json entry
+        run: |
+          FOXE_URL="${{ github.server_url }}/${{ github.repository }}/releases/download/$TAG/$(basename "$FOXE")"
+          pnpm run --silent registry-entry --foxe "$FOXE_URL" > entry.json
+          cat entry.json
+
+          # The entry's sha256sum comes from re-downloading the asset. If it
+          # disagrees with the artifact we just built, the upload did not
+          # round-trip and the registry would pin an unverifiable hash.
+          REMOTE_SHA=$(jq -r .sha256sum entry.json)
+          if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+            echo "Uploaded asset hash $REMOTE_SHA does not match built artifact $LOCAL_SHA" >&2
+            exit 1
+          fi
+
+          {
+            echo "## extensions.json entry"
+            echo
+            echo "Append to \`extensions.json\` in [foxglove/extension-registry](https://github.com/foxglove/extension-registry):"
+            echo
+            echo '```json'
+            cat entry.json
+            echo '```'
+            echo
+            echo 'Add to that repo'"'"'s README "Extensions" list, in alphabetical order:'
+            echo
+            echo '```markdown'
+            jq -r '"- [\(.name)](\(.homepage)) - \(.description)"' entry.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: registry-entry
+          path: entry.json
