@@ -3,6 +3,7 @@ import * as React from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { ClipMeta } from "./clipTypes";
 import { clearDirHandle, loadDirHandle, saveDirHandle } from "./fsStore";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
@@ -49,6 +50,9 @@ function makeTheme(scheme: ColorScheme): Theme {
     accentText: "#7db0ff",
   };
 }
+
+/** Which destructive action is waiting on an inline "are you sure?" confirmation. */
+type ConfirmTarget = { kind: "clip"; id: string } | { kind: "all" };
 
 type ButtonVariant = "primary" | "default" | "link";
 
@@ -173,6 +177,11 @@ const ZERO_STAT: WorkerStat = {
   rotations: 0,
 };
 
+/** Whether the durable clip cache is usable, and which OPFS path the worker is using. */
+type CacheStatus = { available: boolean; mode: string };
+
+const UNKNOWN_CACHE: CacheStatus = { available: true, mode: "unknown" };
+
 // Messages the worker posts back. Kept tolerant of a stale worker build (missing
 // extended fields default to zero in the reader).
 type OutboundMessage =
@@ -193,11 +202,28 @@ type OutboundMessage =
       channels: number;
       rotation?: boolean;
     }
+  /** The full cached-clip list, re-broadcast after every create / evict / delete / clear. */
+  | { type: "clips"; clips: ClipMeta[]; cache?: CacheStatus }
+  /** One cached clip's bytes, in response to a requestClipBytes. */
+  | { type: "clipBytes"; id: string; meta: ClipMeta; buffer: ArrayBuffer }
   | { type: "error"; message: string };
 
+function defaultMcapName(): string {
+  return `diy-dvr-${Date.now()}.mcap`;
+}
+
+/**
+ * Filename for a cached clip. Derived from the clip rather than the wall clock because
+ * "Save all" writes every clip in one loop, and `Date.now()` would give several of them
+ * the same name and silently overwrite files.
+ */
+function clipFileName(meta: ClipMeta): string {
+  const trigger = meta.trigger.replace(/[^A-Za-z0-9._-]/g, "-");
+  return `diy-dvr-${trigger}-${meta.createdAt}.mcap`;
+}
+
 /** Blob + anchor download — the fallback when silent directory write is unavailable. */
-function downloadMcap(buffer: ArrayBuffer): string {
-  const name = `diy-dvr-${Date.now()}.mcap`;
+function downloadMcap(buffer: ArrayBuffer, name: string = defaultMcapName()): string {
   const blob = new Blob([buffer], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -216,8 +242,8 @@ function downloadMcap(buffer: ArrayBuffer): string {
 async function writeMcapFile(
   buffer: ArrayBuffer,
   dirHandle: FileSystemDirectoryHandle,
+  name: string = defaultMcapName(),
 ): Promise<string> {
-  const name = `diy-dvr-${Date.now()}.mcap`;
   const fileHandle = await dirHandle.getFileHandle(name, { create: true });
   const writable = await fileHandle.createWritable();
   await writable.write(buffer);
@@ -276,22 +302,28 @@ async function persistCapture(
   buffer: ArrayBuffer,
   dirHandle: FileSystemDirectoryHandle | undefined,
   trigger: "manual" | "rotation",
+  fileName: string = defaultMcapName(),
 ): Promise<SaveResult> {
   if (!canPickDir || dirHandle == undefined) {
-    return { mode: "download", name: downloadMcap(buffer) };
+    return { mode: "download", name: downloadMcap(buffer, fileName) };
   }
   try {
     if (await hasRwPermission(dirHandle)) {
-      const name = await writeMcapFile(buffer, dirHandle);
+      const name = await writeMcapFile(buffer, dirHandle, fileName);
       return { mode: "folder", name, folder: dirHandle.name };
     }
     // Grant lapsed. Never request (no gesture). Rotations pause; manual saves download.
     if (trigger === "rotation") {
       return { mode: "paused" };
     }
-    return { mode: "download", name: downloadMcap(buffer), reason: "denied" };
+    return { mode: "download", name: downloadMcap(buffer, fileName), reason: "denied" };
   } catch (err) {
-    return { mode: "download", name: downloadMcap(buffer), reason: "error", error: String(err) };
+    return {
+      mode: "download",
+      name: downloadMcap(buffer, fileName),
+      reason: "error",
+      error: String(err),
+    };
   }
 }
 
@@ -310,6 +342,150 @@ function saveStatusText(result: SaveResult): string {
       }
       return `Downloaded ${result.name}`;
   }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb.toFixed(1)} KB`;
+  }
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+function formatDurationSec(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds - minutes * 60)}s`;
+}
+
+/**
+ * Clock label for a clip row. Uses the capture wall-clock time rather than the clip's
+ * `startNanos`, because the latter comes from the source's own clock and is zero for a
+ * source that publishes no time.
+ */
+function formatClock(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString();
+}
+
+/** Short description of where cached clips live, shown next to the clips heading. */
+function cacheModeLabel(cache: CacheStatus): string {
+  if (!cache.available) {
+    return "browser storage unavailable";
+  }
+  switch (cache.mode) {
+    case "sync":
+      return "OPFS (sync)";
+    case "async":
+      return "OPFS (async)";
+    case "unavailable":
+      return "browser storage unavailable";
+    default:
+      return "OPFS";
+  }
+}
+
+function sectionTitleStyle(theme: Theme): React.CSSProperties {
+  return {
+    display: "flex",
+    alignItems: "baseline",
+    gap: "0.5rem",
+    margin: "0 0 0.4rem",
+    paddingBottom: "0.25rem",
+    borderBottom: `1px solid ${theme.border}`,
+    fontSize: "0.6875rem",
+    fontWeight: 600,
+    letterSpacing: "0.04em",
+    textTransform: "uppercase",
+    color: theme.muted,
+  };
+}
+
+type ClipRowProps = {
+  theme: Theme;
+  clip: ClipMeta;
+  expanded: boolean;
+  confirmingDelete: boolean;
+  onToggleExpand: () => void;
+  onSave: () => void;
+  onAskDelete: () => void;
+  onConfirmDelete: () => void;
+  onCancelDelete: () => void;
+};
+
+/** One cached clip: a summary line, expandable into its per-topic message counts. */
+function ClipRow({
+  theme,
+  clip,
+  expanded,
+  confirmingDelete,
+  onToggleExpand,
+  onSave,
+  onAskDelete,
+  onConfirmDelete,
+  onCancelDelete,
+}: ClipRowProps): React.JSX.Element {
+  const topicCounts = Object.entries(clip.topicCounts).sort((a, b) => a[0].localeCompare(b[0]));
+  return (
+    <div style={{ borderTop: `1px solid ${theme.border}`, padding: "0.3rem 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <ThemedButton theme={theme} variant="link" onClick={onToggleExpand}>
+          {expanded ? "▾" : "▸"}
+        </ThemedButton>
+        <span style={{ fontWeight: 600, minWidth: "5.5rem" }}>{clip.triggerLabel}</span>
+        <span style={{ color: theme.muted }}>{formatClock(clip.createdAt)}</span>
+        <span style={{ color: theme.muted }}>{formatDurationSec(clip.durationSec)}</span>
+        <span style={{ color: theme.muted }}>{formatBytes(clip.byteSize)}</span>
+        <span style={{ color: theme.muted }}>{clip.messageCount} msgs</span>
+        <span style={{ flex: "1 1 auto" }} />
+        {confirmingDelete ? (
+          <>
+            <span style={{ color: theme.muted }}>Delete?</span>
+            <ThemedButton theme={theme} variant="link" onClick={onConfirmDelete}>
+              Yes
+            </ThemedButton>
+            <ThemedButton theme={theme} variant="link" onClick={onCancelDelete}>
+              No
+            </ThemedButton>
+          </>
+        ) : (
+          <>
+            <ThemedButton theme={theme} variant="link" onClick={onSave}>
+              Save to disk
+            </ThemedButton>
+            <ThemedButton theme={theme} variant="link" onClick={onAskDelete}>
+              ✕
+            </ThemedButton>
+          </>
+        )}
+      </div>
+      {expanded && (
+        <div
+          style={{
+            display: "grid",
+            rowGap: "0.1rem",
+            margin: "0.25rem 0 0.35rem 1.6rem",
+            fontSize: "0.75rem",
+          }}
+        >
+          {topicCounts.length === 0 ? (
+            <span style={{ color: theme.muted }}>No topics recorded.</span>
+          ) : (
+            topicCounts.map(([topic, count]) => (
+              <div key={topic} style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: theme.muted, wordBreak: "break-all" }}>{topic}</span>
+                <span>{count}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function statSummary(stat: WorkerStat, config: DvrConfig): { used: string; cap: string } {
@@ -335,9 +511,17 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [saveFolderName, setSaveFolderName] = useState<string | undefined>(undefined);
   const [lastSaveStatus, setLastSaveStatus] = useState<string>("");
   const [colorScheme, setColorScheme] = useState<ColorScheme>("dark");
+  // Durable clips, oldest first, as broadcast by the worker (the single OPFS owner).
+  const [clips, setClips] = useState<ClipMeta[]>([]);
+  const [cache, setCache] = useState<CacheStatus>(UNKNOWN_CACHE);
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [confirming, setConfirming] = useState<ConfirmTarget | undefined>(undefined);
 
   const workerRef = useRef<Worker | undefined>(undefined);
   const dirHandleRef = useRef<FileSystemDirectoryHandle | undefined>(undefined);
+  // Serializes clip writes: "Save all" fans out N requests and the replies arrive
+  // independently, so chain them rather than letting the writes interleave.
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
 
   // Refs mirror the latest config/topics so the (stable) settings action handler
   // never goes stale without being recreated on every render.
@@ -345,6 +529,8 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   configRef.current = config;
   const topicsRef = useRef(topics);
   topicsRef.current = topics;
+  const clipsRef = useRef(clips);
+  clipsRef.current = clips;
 
   const enabledTopics = useMemo(
     () => topics.filter((topic) => !config.disabledTopics.includes(topic.name)),
@@ -387,6 +573,29 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           });
           break;
         }
+        case "clips":
+          setClips(data.clips);
+          setCache(data.cache ?? UNKNOWN_CACHE);
+          break;
+        case "clipBytes": {
+          // Queue behind any in-flight clip write so "Save all" writes one file at a time.
+          const { buffer, meta } = data;
+          saveChainRef.current = saveChainRef.current
+            .then(async () => {
+              const result = await persistCapture(
+                buffer,
+                dirHandleRef.current,
+                "manual",
+                clipFileName(meta),
+              );
+              setLastSaveStatus(saveStatusText(result));
+            })
+            .catch((err: unknown) => {
+              console.error("[diy-dvr] failed to save clip", err);
+              setLastSaveStatus(`Clip save failed: ${String(err)}`);
+            });
+          break;
+        }
         case "error":
           console.error("[diy-dvr] worker save failed", data.message);
           setLastSaveStatus(`Error: ${data.message}`);
@@ -402,6 +611,28 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       worker.terminate();
       URL.revokeObjectURL(url);
       workerRef.current = undefined;
+    };
+  }, []);
+
+  // Snapshot the buffer into a durable clip when the panel is about to lose the CPU or go
+  // away entirely. Browsers throttle worker timers in background tabs, so the worker's own
+  // gap timer cannot be relied on once we are hidden — hence an explicit trigger here.
+  // `pagehide` is best effort: the clip build usually cannot finish, which is what the
+  // throttled OPFS mirror (promoted to a "recovered" clip on the next mount) is for.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        workerRef.current?.postMessage({ type: "trigger", tag: "backgrounded" });
+      }
+    };
+    const onPageHide = () => {
+      workerRef.current?.postMessage({ type: "trigger", tag: "closing" });
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", onPageHide);
     };
   }, []);
 
@@ -525,6 +756,8 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         config.budgetMode === "bytes" ? Math.round(config.budgetValue * 1024 * 1024) : undefined,
       autoSave: autoSaveEffective,
       enabledTopics: enabledTopics.map((topic) => topic.name),
+      maxCacheBytes: Math.round(config.maxCacheMb * 1024 * 1024),
+      gapMs: Math.round(config.gapThresholdSec * 1000),
     });
   }, [config, enabledTopics, workerReady, saveFolderName]);
 
@@ -587,21 +820,25 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     );
   }, [context, config, topics, saveFolderName, actionHandler]);
 
-  const onSave = useCallback(() => {
-    // The click gesture is live now but gone by the time the worker posts "saved",
-    // so acquire the RW grant here (query-then-request). The async "saved" handler
-    // then only queries and writes silently — deterministic, no native dialog.
-    void (async () => {
-      const dirHandle = dirHandleRef.current;
-      if (canPickDir && dirHandle != undefined) {
-        const granted = await requestRwPermission(dirHandle);
-        if (!granted) {
-          setLastSaveStatus("Folder write permission denied — saving as browser download");
-        }
+  // The click gesture is live now but gone by the time the worker posts the bytes back, so
+  // acquire the RW grant here (query-then-request). The async reply handler then only
+  // queries and writes silently — deterministic, no native dialog.
+  const prewarmSaveGrant = useCallback(async () => {
+    const dirHandle = dirHandleRef.current;
+    if (canPickDir && dirHandle != undefined) {
+      const granted = await requestRwPermission(dirHandle);
+      if (!granted) {
+        setLastSaveStatus("Folder write permission denied — saving as browser download");
       }
+    }
+  }, []);
+
+  const onSave = useCallback(() => {
+    void (async () => {
+      await prewarmSaveGrant();
       workerRef.current?.postMessage({ type: "save" });
     })();
-  }, []);
+  }, [prewarmSaveGrant]);
 
   const onReset = useCallback(() => {
     workerRef.current?.postMessage({ type: "reset" });
@@ -610,10 +847,71 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     setLastSaveStatus("");
   }, []);
 
+  /** Snapshot the current buffer into a durable clip on demand. */
+  const onCacheClip = useCallback(() => {
+    workerRef.current?.postMessage({ type: "trigger", tag: "manual-clip" });
+  }, []);
+
+  const onSaveClip = useCallback(
+    (id: string) => {
+      void (async () => {
+        await prewarmSaveGrant();
+        workerRef.current?.postMessage({ type: "requestClipBytes", id });
+      })();
+    },
+    [prewarmSaveGrant],
+  );
+
+  /** Request every cached clip, oldest first, and write them in that order. */
+  const onSaveAll = useCallback(() => {
+    void (async () => {
+      await prewarmSaveGrant();
+      const worker = workerRef.current;
+      if (worker == undefined) {
+        return;
+      }
+      for (const clip of clipsRef.current) {
+        worker.postMessage({ type: "requestClipBytes", id: clip.id });
+      }
+    })();
+  }, [prewarmSaveGrant]);
+
+  const onDeleteClip = useCallback((id: string) => {
+    workerRef.current?.postMessage({ type: "deleteClip", id });
+    setConfirming(undefined);
+    setExpandedIds((previous) => {
+      const next = new Set(previous);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const onClearClips = useCallback(() => {
+    workerRef.current?.postMessage({ type: "clearClips" });
+    setConfirming(undefined);
+    setExpandedIds(new Set());
+  }, []);
+
+  const onToggleExpand = useCallback((id: string) => {
+    setExpandedIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
   const budget = statSummary(stat, config);
   const captureOn = workerReady && enabledTopics.length > 0;
   const saveDestination = saveFolderName ?? "Browser download";
   const theme = makeTheme(colorScheme);
+  const cacheBytes = clips.reduce((total, clip) => total + clip.byteSize, 0);
+  // Newest first on screen; "Save all" still writes chronologically.
+  const clipsNewestFirst = [...clips].reverse();
+  const hasClips = clips.length > 0;
 
   const statRows: Array<{ label: string; value: React.ReactNode }> = [
     { label: "Worker", value: workerReady ? "Ready" : "Starting…" },
@@ -638,19 +936,70 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       }}
     >
       <p style={{ margin: "0 0 0.85rem", color: theme.muted, fontSize: "0.75rem" }}>
-        Topics, budget, and auto-save are in panel Settings (gear icon).
+        Topics, lookback, auto-save, and the clip cache are in panel Settings (gear icon).
       </p>
 
-      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.85rem" }}>
+      <div
+        style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.85rem" }}
+      >
+        <ThemedButton
+          theme={theme}
+          variant="default"
+          disabled={!workerReady || !hasClips}
+          onClick={onSaveAll}
+        >
+          Save all
+        </ThemedButton>
+        {confirming?.kind === "all" ? (
+          <>
+            <span style={{ color: theme.muted }}>Clear {clips.length} cached clips?</span>
+            <ThemedButton theme={theme} variant="link" onClick={onClearClips}>
+              Yes
+            </ThemedButton>
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              onClick={() => {
+                setConfirming(undefined);
+              }}
+            >
+              No
+            </ThemedButton>
+          </>
+        ) : (
+          <ThemedButton
+            theme={theme}
+            variant="default"
+            disabled={!workerReady || !hasClips}
+            onClick={() => {
+              setConfirming({ kind: "all" });
+            }}
+          >
+            Clear all
+          </ThemedButton>
+        )}
+      </div>
+
+      <div style={sectionTitleStyle(theme)}>Current buffer</div>
+
+      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem" }}>
         <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onSave}>
-          Save MCAP
+          Save to disk
+        </ThemedButton>
+        <ThemedButton
+          theme={theme}
+          variant="default"
+          disabled={!workerReady || stat.bufferedMsgs === 0}
+          onClick={onCacheClip}
+        >
+          Cache clip
         </ThemedButton>
         <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onReset}>
           Reset buffer
         </ThemedButton>
       </div>
 
-      <div style={{ display: "grid", rowGap: "0.15rem" }}>
+      <div style={{ display: "grid", rowGap: "0.15rem", marginBottom: "1rem" }}>
         {statRows.map((row) => (
           <div
             key={row.label}
@@ -663,6 +1012,49 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           </div>
         ))}
       </div>
+
+      <div style={sectionTitleStyle(theme)}>
+        <span>Cached clips ({clips.length})</span>
+        <span style={{ flex: "1 1 auto" }} />
+        <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: "normal" }}>
+          {formatBytes(cacheBytes)} / {config.maxCacheMb} MB · {cacheModeLabel(cache)}
+        </span>
+      </div>
+
+      {hasClips ? (
+        <div>
+          {clipsNewestFirst.map((clip) => (
+            <ClipRow
+              key={clip.id}
+              theme={theme}
+              clip={clip}
+              expanded={expandedIds.has(clip.id)}
+              confirmingDelete={confirming?.kind === "clip" && confirming.id === clip.id}
+              onToggleExpand={() => {
+                onToggleExpand(clip.id);
+              }}
+              onSave={() => {
+                onSaveClip(clip.id);
+              }}
+              onAskDelete={() => {
+                setConfirming({ kind: "clip", id: clip.id });
+              }}
+              onConfirmDelete={() => {
+                onDeleteClip(clip.id);
+              }}
+              onCancelDelete={() => {
+                setConfirming(undefined);
+              }}
+            />
+          ))}
+        </div>
+      ) : (
+        <p style={{ margin: 0, color: theme.muted, fontSize: "0.75rem" }}>
+          {cache.available
+            ? "No cached clips yet — a clip is captured on a connection gap, when the tab is hidden, and on close. Cached clips survive a reconnect."
+            : "Browser storage is unavailable here, so clips cannot be cached. Live capture and Save to disk still work."}
+        </p>
+      )}
     </div>
   );
 }
