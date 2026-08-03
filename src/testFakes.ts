@@ -38,6 +38,13 @@ export type FakeStoreOptions = {
    * Keyed by owning instance id.
    */
   lockedMirrors?: Set<string>;
+  /**
+   * Make the next N `listClips()` calls reject, standing in for the transient OPFS
+   * exclusive-lock contention a reconnect can hit. Decremented on each failure.
+   */
+  failListClipsTimes?: number;
+  /** Make `listOrphanMirrors()` reject. */
+  failOrphanMirrors?: boolean;
 };
 
 /** A `ClipStore` over an in-memory backing. Deep-copies bytes, like a real filesystem. */
@@ -66,7 +73,13 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
       }
       backing.clips.set(meta.id, { meta, bytes: bytes.slice() });
     },
-    listClips: async (): Promise<ClipMeta[]> => sorted(),
+    listClips: async (): Promise<ClipMeta[]> => {
+      if (opts.failListClipsTimes != undefined && opts.failListClipsTimes > 0) {
+        opts.failListClipsTimes--;
+        throw new Error("fake OPFS: clips directory is locked");
+      }
+      return sorted();
+    },
     readClip: async (id: string): Promise<Uint8Array | undefined> =>
       backing.clips.get(id)?.bytes.slice(),
     deleteClip: async (id: string): Promise<void> => {
@@ -81,6 +94,9 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
       backing.mirrors.set(instanceId, { meta, bytes: bytes.slice() });
     },
     listOrphanMirrors: async (): Promise<MirrorEntry[]> => {
+      if (opts.failOrphanMirrors === true) {
+        throw new Error("fake OPFS: mirror directory is locked");
+      }
       const orphans: MirrorEntry[] = [];
       for (const [owner, entry] of backing.mirrors) {
         if (owner !== instanceId) {

@@ -53,8 +53,31 @@ function harness(
     emit: out.emit,
     frame: opts.frame ?? sizedFrame(128),
     mirrorIntervalMs: opts.mirrorIntervalMs ?? NO_MIRROR,
+    // Retry backoff without real timers.
+    delay: async () => {
+      await Promise.resolve();
+    },
   });
   return { engine, clock, backing, store, out };
+}
+
+/** Seed a sealed clip straight into the backing, bypassing the engine. */
+function seedClip(
+  backing: FakeBacking,
+  overrides: Partial<ClipMeta> & Pick<ClipMeta, "id" | "trigger" | "createdAt">,
+): void {
+  const meta: ClipMeta = {
+    triggerLabel: overrides.trigger,
+    startNanos: "0",
+    endNanos: "0",
+    durationSec: 0,
+    byteSize: 100,
+    messageCount: 1,
+    topicCounts: { "/a": 1 },
+    sealed: true,
+    ...overrides,
+  };
+  backing.clips.set(meta.id, { meta, bytes: new Uint8Array(meta.byteSize) });
 }
 
 function config(overrides: Partial<EngineConfig> = {}): EngineConfig {
@@ -286,6 +309,164 @@ describe("clip triggers", () => {
     engine.reset();
     expect(engine.bufferedRecords()).toHaveLength(0);
     expect(backing.clips.size).toBe(1);
+  });
+});
+
+describe("auto-save rotation", () => {
+  it("caches the rotated window as well as handing it to the panel", async () => {
+    // The rotation has already dropped the window from the live ring, and the folder write
+    // pauses whenever the directory's read-write grant has lapsed — which it does on every
+    // page load. Without a cached copy the window is simply gone.
+    const { engine, backing, out } = harness({ frame: sizedFrame(512) });
+    engine.start();
+    engine.configure(config({ budgetNanos: 5n * 1_000_000_000n, autoSave: true }));
+    for (let sec = 100; sec <= 110; sec++) {
+      engine.addMessage(makeMsg("/a", sec));
+    }
+    await engine.whenIdle();
+
+    const clips = storedClips(backing);
+    expect(clips).toHaveLength(1);
+    expect(clips[0]).toMatchObject({
+      trigger: "rotation",
+      triggerLabel: "auto-save",
+      sealed: true,
+      byteSize: 512,
+    });
+    // The rotation still reaches the panel for the opportunistic folder write.
+    expect(out.last("saved")?.rotation).toBe(true);
+    expect(engine.stats().rotations).toBeGreaterThan(0);
+  });
+
+  it("does not cache anything when auto-save is off", async () => {
+    const { engine, backing, out } = harness();
+    engine.start();
+    engine.configure(config({ budgetNanos: 5n * 1_000_000_000n, autoSave: false }));
+    for (let sec = 100; sec <= 110; sec++) {
+      engine.addMessage(makeMsg("/a", sec));
+    }
+    await engine.whenIdle();
+
+    expect(backing.clips.size).toBe(0);
+    expect(out.all("saved")).toHaveLength(0);
+  });
+
+  it("keeps rotation windows at the same eviction priority as user clips", async () => {
+    // An auto-save window is data the user asked to keep, so it must not be treated as
+    // churn the way a recovered clip is.
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "rot", trigger: "rotation", createdAt: 1000, byteSize: 100 });
+    seedClip(backing, { id: "rec", trigger: "recovered", createdAt: 5000, byteSize: 100 });
+    const { engine } = harness({ backing });
+    engine.start();
+    engine.configure(config({ maxCacheBytes: 150 }));
+    await engine.whenIdle();
+
+    // The newer recovered clip goes even though the rotation window is older.
+    expect(storedClips(backing).map((clip) => clip.id)).toEqual(["rot"]);
+  });
+});
+
+describe("rehydrate resilience", () => {
+  it("retries a transient failure and still loads the clips", async () => {
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "a", trigger: "gap", createdAt: 1000 });
+    const { engine, out } = harness({
+      backing,
+      storeOptions: { failListClipsTimes: 1 },
+    });
+    engine.start();
+    await engine.whenIdle();
+
+    expect(out.last("clips")?.clips.map((clip) => clip.id)).toEqual(["a"]);
+    expect(out.all("error")).toHaveLength(0);
+  });
+
+  it("still broadcasts when a rehydrate step keeps failing", async () => {
+    // A throw used to skip the broadcast entirely, leaving the panel on its empty initial
+    // list until the next mutation — cached clips looked lost.
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "a", trigger: "gap", createdAt: 1000 });
+    const { engine, out } = harness({
+      backing,
+      storeOptions: { failListClipsTimes: 99 },
+    });
+    engine.start();
+    await engine.whenIdle();
+
+    expect(out.last("clips")).toBeDefined();
+    expect(out.last("error")?.message).toContain("read the cached clips");
+    // And the failure is reported once, not per retry.
+    expect(out.all("error")).toHaveLength(1);
+  });
+
+  it("still broadcasts when session recovery fails", async () => {
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "a", trigger: "manual-clip", createdAt: 1000 });
+    const { engine, out } = harness({ backing, storeOptions: { failOrphanMirrors: true } });
+    engine.start();
+    await engine.whenIdle();
+
+    // The clips that did load are still shown.
+    expect(out.last("clips")?.clips.map((clip) => clip.id)).toEqual(["a"]);
+    expect(out.last("error")?.message).toContain("recover the previous session");
+  });
+});
+
+describe("recovered-clip churn", () => {
+  it("keeps only the latest recovered clip", async () => {
+    // Every reload and reconnect promotes the previous worker's mirror. Left alone they
+    // accumulate and start pushing real clips out of the cache.
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "old-rec-1", trigger: "recovered", createdAt: 1000 });
+    seedClip(backing, { id: "old-rec-2", trigger: "recovered", createdAt: 2000 });
+    seedClip(backing, { id: "real", trigger: "gap", createdAt: 1500 });
+    backing.mirrors.set("dead-worker", {
+      meta: makeMirrorMeta({ messageCount: 3 }),
+      bytes: new Uint8Array([1, 2, 3]),
+    });
+
+    const { engine } = harness({ backing, storeOptions: { instanceId: "live-worker" } });
+    engine.start();
+    await engine.whenIdle();
+
+    const kept = storedClips(backing);
+    const recovered = kept.filter((clip) => clip.trigger === "recovered");
+    expect(recovered).toHaveLength(1);
+    // The survivor is the one just promoted, not an older leftover.
+    expect(recovered[0]?.id).not.toBe("old-rec-1");
+    expect(recovered[0]?.id).not.toBe("old-rec-2");
+    // The user's clip is untouched.
+    expect(kept.some((clip) => clip.id === "real")).toBe(true);
+  });
+
+  it("evicts a recovered clip before any clip the user asked for", async () => {
+    const backing = createFakeBacking();
+    // The recovered clip is the newest, so plain oldest-first eviction would spare it and
+    // drop the user's clips instead.
+    seedClip(backing, { id: "gap-old", trigger: "gap", createdAt: 1000, byteSize: 100 });
+    seedClip(backing, { id: "manual", trigger: "manual-clip", createdAt: 2000, byteSize: 100 });
+    seedClip(backing, { id: "recovered", trigger: "recovered", createdAt: 9000, byteSize: 100 });
+
+    const { engine } = harness({ backing });
+    engine.start();
+    engine.configure(config({ maxCacheBytes: 250 }));
+    await engine.whenIdle();
+
+    expect(storedClips(backing).map((clip) => clip.id)).toEqual(["gap-old", "manual"]);
+  });
+
+  it("still keeps one clip when only recovered clips remain", async () => {
+    const backing = createFakeBacking();
+    seedClip(backing, { id: "rec-1", trigger: "recovered", createdAt: 1000, byteSize: 100 });
+    seedClip(backing, { id: "rec-2", trigger: "recovered", createdAt: 2000, byteSize: 100 });
+
+    const { engine } = harness({ backing });
+    engine.start();
+    engine.configure(config({ maxCacheBytes: 50 }));
+    await engine.whenIdle();
+
+    expect(storedClips(backing)).toHaveLength(1);
   });
 });
 

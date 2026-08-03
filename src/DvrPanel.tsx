@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { ClipMeta } from "./clipTypes";
 import { clearDirHandle, loadDirHandle, saveDirHandle } from "./fsStore";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
+import { SaveResult, SaveStatus, statusFromResult } from "./saveStatus";
 import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
 
 // Extensions render plain React with no access to the app's MUI theme, so we drive
@@ -395,11 +396,6 @@ async function requestRwPermission(dirHandle: FileSystemDirectoryHandle): Promis
   return perm === "granted";
 }
 
-type SaveResult =
-  | { mode: "folder"; name: string; folder: string }
-  | { mode: "paused" }
-  | { mode: "download"; name: string; reason?: "denied" | "error"; error?: string };
-
 /**
  * Decide where the freshly-sealed MCAP goes and perform the write/download.
  * Query-only on permission (safe in the gesture-less "saved" callback) — a lapsed
@@ -431,23 +427,6 @@ async function persistCapture(
       reason: "error",
       error: String(err),
     };
-  }
-}
-
-function saveStatusText(result: SaveResult): string {
-  switch (result.mode) {
-    case "folder":
-      return `Saved ${result.name} → ${result.folder}`;
-    case "paused":
-      return "Auto-save paused — click Save to re-grant folder access";
-    case "download":
-      if (result.reason === "denied") {
-        return `Permission denied — downloaded ${result.name}`;
-      }
-      if (result.reason === "error") {
-        return `Write failed (${result.error ?? ""}) — downloaded ${result.name}`;
-      }
-      return `Downloaded ${result.name}`;
   }
 }
 
@@ -759,12 +738,20 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [config, setConfig] = useState<DvrConfig>(() => ({
     ...DEFAULT_CONFIG,
     ...(context.initialState as Partial<DvrConfig> | undefined),
+    // Auto-save is a per-session opt-in and never restored, however it was persisted.
+    // Chromium drops a directory's read-write grant back to "prompt" across a page load,
+    // and rotations have no user gesture, so they can only query the grant — a restored
+    // "on" would silently pause every rotation. Turning it on is a gesture, which is
+    // exactly when the grant can be re-requested.
+    autoSave: false,
   }));
   const [saveFolderName, setSaveFolderName] = useState<string | undefined>(undefined);
-  const [lastSaveStatus, setLastSaveStatus] = useState<string>("");
+  const [lastSave, setLastSave] = useState<SaveStatus | undefined>(undefined);
   const [colorScheme, setColorScheme] = useState<ColorScheme>("dark");
   // Durable clips, oldest first, as broadcast by the worker (the single OPFS owner).
-  const [clips, setClips] = useState<ClipMeta[]>([]);
+  // `undefined` means the worker has not reported yet: an empty array renders as
+  // "confirmed empty", so a slow or failed rehydrate would otherwise look like data loss.
+  const [clips, setClips] = useState<ClipMeta[] | undefined>(undefined);
   const [cache, setCache] = useState<CacheStatus>(UNKNOWN_CACHE);
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [confirming, setConfirming] = useState<ConfirmTarget | undefined>(undefined);
@@ -824,7 +811,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           // (see onSave), so by the time this callback runs the query succeeds.
           const trigger = data.rotation === true ? "rotation" : "manual";
           void persistCapture(buffer, dirHandle, trigger).then((result) => {
-            setLastSaveStatus(saveStatusText(result));
+            setLastSave(statusFromResult(result));
           });
           break;
         }
@@ -843,17 +830,17 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
                 "manual",
                 clipFileName(meta),
               );
-              setLastSaveStatus(saveStatusText(result));
+              setLastSave(statusFromResult(result));
             })
             .catch((err: unknown) => {
               console.error("[diy-dvr] failed to save clip", err);
-              setLastSaveStatus(`Clip save failed: ${String(err)}`);
+              setLastSave({ text: `Clip save failed: ${String(err)}`, severity: "error" });
             });
           break;
         }
         case "error":
           console.error("[diy-dvr] worker save failed", data.message);
-          setLastSaveStatus(`Error: ${data.message}`);
+          setLastSave({ text: data.message, severity: "error" });
           break;
       }
     };
@@ -930,7 +917,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         // and fall back to the native download dialog.
         const granted = await requestRwPermission(handle);
         if (!granted) {
-          setLastSaveStatus("Folder not granted write permission — using browser download");
+          setLastSave({
+            text: "Folder not granted write permission — using browser download",
+            severity: "warn",
+          });
           return; // leave the previous handle / browser-download in place
         }
         dirHandleRef.current = handle;
@@ -1044,7 +1034,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           void (async () => {
             const granted = await requestRwPermission(dirHandle);
             if (!granted) {
-              setLastSaveStatus("Auto-save not enabled — folder write permission denied");
+              setLastSave({
+                text: "Auto-save not enabled — folder write permission denied",
+                severity: "warn",
+              });
               return; // don't enable without a live grant
             }
             const next = applyAction(configRef.current, action);
@@ -1083,7 +1076,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     if (canPickDir && dirHandle != undefined) {
       const granted = await requestRwPermission(dirHandle);
       if (!granted) {
-        setLastSaveStatus("Folder write permission denied — saving as browser download");
+        setLastSave({
+          text: "Folder write permission denied — saving as browser download",
+          severity: "warn",
+        });
       }
     }
   }, []);
@@ -1099,7 +1095,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     workerRef.current?.postMessage({ type: "reset" });
     setForwarded(0);
     setStat(ZERO_STAT);
-    setLastSaveStatus("");
+    setLastSave(undefined);
     setConfirming(undefined);
   }, []);
 
@@ -1126,7 +1122,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       if (worker == undefined) {
         return;
       }
-      for (const clip of clipsRef.current) {
+      for (const clip of clipsRef.current ?? []) {
         worker.postMessage({ type: "requestClipBytes", id: clip.id });
       }
     })();
@@ -1164,13 +1160,19 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const captureOn = workerReady && enabledTopics.length > 0;
   const saveDestination = saveFolderName ?? "Browser download";
   const theme = makeTheme(colorScheme);
-  const cacheBytes = clips.reduce((total, clip) => total + clip.byteSize, 0);
+  const clipsLoaded = clips != undefined;
+  const loadedClips = clips ?? [];
+  const cacheBytes = loadedClips.reduce((total, clip) => total + clip.byteSize, 0);
   // Newest first on screen; "Save all" still writes chronologically.
-  const clipsNewestFirst = [...clips].reverse();
-  const hasClips = clips.length > 0;
+  const clipsNewestFirst = [...loadedClips].reverse();
+  const hasClips = loadedClips.length > 0;
 
   const hasBuffer = stat.bufferedMsgs > 0;
   const status = bufferStatus(stat, { workerReady, enabledTopics: enabledTopics.length });
+  const alert =
+    lastSave != undefined && lastSave.severity !== "ok"
+      ? { text: lastSave.text, color: lastSave.severity === "error" ? theme.danger : theme.warn }
+      : undefined;
   const capBytes = Math.round(config.maxCacheMb * 1024 * 1024);
   const fillStyle: React.CSSProperties = { flex: `1 1 120px` };
 
@@ -1183,7 +1185,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     { label: "Rotations", value: stat.rotations },
     { label: "Buffered", value: `${stat.bufferedMsgs} msgs / ${stat.channels} channels` },
     { label: "Save destination", value: saveDestination },
-    { label: "Last save", value: lastSaveStatus.length > 0 ? lastSaveStatus : "—" },
+    { label: "Last save", value: lastSave?.text ?? "—" },
   ];
 
   return (
@@ -1307,6 +1309,39 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             {status.label} — {budget.used} / {budget.cap}
           </span>
         </div>
+
+        {/* A paused or denied save means data is not reaching the folder. That is far too
+            easy to miss in a muted stat row, so it stays pinned and coloured until either
+            the next successful save replaces it or the user dismisses it. */}
+        {alert != undefined && (
+          <div
+            role="alert"
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "0.4rem",
+              marginTop: "0.4rem",
+              padding: "0.3rem 0.4rem",
+              border: `1px solid ${alert.color}`,
+              color: alert.color,
+              fontSize: "0.75rem",
+              lineHeight: 1.35,
+            }}
+          >
+            <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>{alert.text}</span>
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              title="Dismiss"
+              style={{ color: alert.color, padding: "0 0.2rem" }}
+              onClick={() => {
+                setLastSave(undefined);
+              }}
+            >
+              ✕
+            </ThemedButton>
+          </div>
+        )}
       </div>
 
       <div style={sectionTitleStyle(theme)}>
@@ -1339,7 +1374,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       )}
 
       {/* Save feedback matters even with the details collapsed, so surface it either way. */}
-      {!showDetails && lastSaveStatus.length > 0 && (
+      {!showDetails && lastSave?.severity === "ok" && (
         <p
           style={{
             margin: "0 0 1rem",
@@ -1348,12 +1383,12 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             wordBreak: "break-word",
           }}
         >
-          {lastSaveStatus}
+          {lastSave.text}
         </p>
       )}
 
       <div style={sectionTitleStyle(theme)}>
-        <span>Cached clips ({clips.length})</span>
+        <span>Cached clips ({clipsLoaded ? loadedClips.length : "…"})</span>
         <span style={{ flex: "1 1 auto" }} />
         {/* These act on the cache, so they live with it rather than at the top of the
             panel. Nothing to act on at zero clips, so they are not rendered at all. */}
@@ -1369,7 +1404,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
                 letterSpacing: "normal",
               }}
             >
-              Clear {clips.length}?
+              Clear {loadedClips.length}?
               <ThemedButton theme={theme} variant="link" onClick={onClearClips}>
                 Yes
               </ThemedButton>
@@ -1448,9 +1483,11 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         </div>
       ) : (
         <p style={{ margin: 0, color: theme.muted, fontSize: "0.75rem" }}>
-          {cache.available
-            ? "No cached clips yet — a clip is captured on a connection gap, when the tab is hidden, and on close. Cached clips survive a reconnect."
-            : "Browser storage is unavailable here, so clips cannot be cached. Live capture and Save to disk still work."}
+          {!clipsLoaded
+            ? "Reading the clip cache…"
+            : cache.available
+              ? "No cached clips yet — a clip is captured on a connection gap, when the tab is hidden, on close, and on each auto-save window. Cached clips survive a reconnect."
+              : "Browser storage is unavailable here, so clips cannot be cached. Live capture and Save to disk still work."}
         </p>
       )}
     </div>

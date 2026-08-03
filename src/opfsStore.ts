@@ -156,6 +156,24 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
   }
 
   /**
+   * Run an operation against the cache directories, re-opening them once if they turn out
+   * to be gone. The handles are memoized, so anything that removes the directory from
+   * underneath us — the browser's "clear site data", most plausibly — would otherwise make
+   * every later call fail with a raw `NotFoundError` until the panel is reloaded.
+   */
+  async function withDirs<T>(operation: (open: OpfsDirs) => Promise<T>): Promise<T> {
+    try {
+      return await operation(await dirs());
+    } catch (err) {
+      if (!isNotFound(err)) {
+        throw err;
+      }
+      dirsPromise = undefined;
+      return await operation(await dirs());
+    }
+  }
+
+  /**
    * Write a whole file, preferring a synchronous access handle. The sync path is the
    * simplest and fastest option for the throttled mirror, but it does not exist
    * everywhere, so any failure latches a permanent fall back to the async writable.
@@ -276,9 +294,10 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
   }
 
   async function listClips(): Promise<ClipMeta[]> {
-    const { clips } = await dirs();
-    const found = await readIndex(clips, CLIP_EXT);
-    return found.map((entry) => entry.meta).sort(compareByCreation);
+    return await withDirs(async ({ clips }) => {
+      const found = await readIndex(clips, CLIP_EXT);
+      return found.map((entry) => entry.meta).sort(compareByCreation);
+    });
   }
 
   return {
@@ -311,24 +330,24 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     instanceId: (): string => ownId,
 
     writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
-      const { clips } = await dirs();
-      await writeFile(clips, meta.id + CLIP_EXT, bytes);
-      await writeFile(clips, meta.id + META_EXT, encodeMeta(meta));
+      await withDirs(async ({ clips }) => {
+        await writeFile(clips, meta.id + CLIP_EXT, bytes);
+        await writeFile(clips, meta.id + META_EXT, encodeMeta(meta));
+      });
     },
 
     listClips,
 
-    readClip: async (id: string): Promise<Uint8Array | undefined> => {
-      const { clips } = await dirs();
-      return await readFile(clips, id + CLIP_EXT);
-    },
+    readClip: async (id: string): Promise<Uint8Array | undefined> =>
+      await withDirs(async ({ clips }) => await readFile(clips, id + CLIP_EXT)),
 
     deleteClip: async (id: string): Promise<void> => {
-      const { clips } = await dirs();
-      // Sidecar first: without it the payload is already invisible to `listClips`, so a
-      // half-finished delete never leaves metadata pointing at missing bytes.
-      await removeIfPresent(clips, id + META_EXT);
-      await removeIfPresent(clips, id + CLIP_EXT);
+      await withDirs(async ({ clips }) => {
+        // Sidecar first: without it the payload is already invisible to `listClips`, so a
+        // half-finished delete never leaves metadata pointing at missing bytes.
+        await removeIfPresent(clips, id + META_EXT);
+        await removeIfPresent(clips, id + CLIP_EXT);
+      });
     },
 
     clearClips: async (): Promise<void> => {
@@ -345,37 +364,39 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     },
 
     writeMirror: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
-      const { mirror } = await dirs();
-      await writeFile(mirror, ownId + MIRROR_EXT, bytes);
-      await writeFile(mirror, ownId + META_EXT, encodeMeta(meta));
+      await withDirs(async ({ mirror }) => {
+        await writeFile(mirror, ownId + MIRROR_EXT, bytes);
+        await writeFile(mirror, ownId + META_EXT, encodeMeta(meta));
+      });
     },
 
-    listOrphanMirrors: async (): Promise<MirrorEntry[]> => {
-      const { mirror } = await dirs();
-      const found = await readIndex(mirror, MIRROR_EXT);
-      const orphans: MirrorEntry[] = [];
-      for (const entry of found) {
-        if (entry.id === ownId) {
-          continue; // our own live mirror
-        }
-        try {
-          const bytes = await readFile(mirror, entry.id + MIRROR_EXT);
-          if (bytes != undefined) {
-            orphans.push({ instanceId: entry.id, meta: entry.meta, bytes });
+    listOrphanMirrors: async (): Promise<MirrorEntry[]> =>
+      await withDirs(async ({ mirror }) => {
+        const found = await readIndex(mirror, MIRROR_EXT);
+        const orphans: MirrorEntry[] = [];
+        for (const entry of found) {
+          if (entry.id === ownId) {
+            continue; // our own live mirror
           }
-        } catch {
-          // Unreadable, typically because a live panel holds the file. Skip it rather than
-          // failing the whole rehydrate; the cached clips still load.
+          try {
+            const bytes = await readFile(mirror, entry.id + MIRROR_EXT);
+            if (bytes != undefined) {
+              orphans.push({ instanceId: entry.id, meta: entry.meta, bytes });
+            }
+          } catch {
+            // Unreadable, typically because a live panel holds the file. Skip it rather than
+            // failing the whole rehydrate; the cached clips still load.
+          }
         }
-      }
-      return orphans.sort((a, b) => compareByCreation(a.meta, b.meta));
-    },
+        return orphans.sort((a, b) => compareByCreation(a.meta, b.meta));
+      }),
 
     clearMirror: async (instanceToClear?: string): Promise<void> => {
-      const { mirror } = await dirs();
-      const id = instanceToClear == undefined ? ownId : sanitizeId(instanceToClear);
-      await removeIfPresent(mirror, id + META_EXT);
-      await removeIfPresent(mirror, id + MIRROR_EXT);
+      await withDirs(async ({ mirror }) => {
+        const id = instanceToClear == undefined ? ownId : sanitizeId(instanceToClear);
+        await removeIfPresent(mirror, id + META_EXT);
+        await removeIfPresent(mirror, id + MIRROR_EXT);
+      });
     },
   };
 }

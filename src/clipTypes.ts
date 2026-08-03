@@ -8,10 +8,24 @@
  * - `backgrounded` — the tab was hidden.
  * - `closing` — the tab / app is going away (best effort).
  * - `manual-clip` — the user pressed "Cache clip".
+ * - `rotation` — an auto-save window that filled up. The window is cleared from the live
+ *   ring as it rotates, so caching it is what makes the data survive a folder write that
+ *   cannot complete (a lapsed write permission pauses the write, and there is no gesture
+ *   in that code path to re-request one).
  * - `recovered` — promoted from an un-sealed mirror left behind by a previous worker
- *   (a crash, or the `initPanel` teardown that happens on a reconnect).
+ *   (a crash, or the `initPanel` teardown that happens on a reconnect). Only the latest
+ *   one is kept, and it is evicted ahead of anything the user asked for.
  */
-export type ClipTrigger = "gap" | "backgrounded" | "closing" | "manual-clip" | "recovered";
+export type ClipTrigger =
+  | "gap"
+  | "backgrounded"
+  | "closing"
+  | "manual-clip"
+  | "rotation"
+  | "recovered";
+
+/** Triggers the panel can ask for directly. */
+export type PanelTrigger = "backgrounded" | "closing" | "manual-clip";
 
 /**
  * Everything known about one cached clip. Written to OPFS as a JSON sidecar next to the

@@ -25,7 +25,7 @@
 // writer, no overlapping builds, and deterministic ordering for the tests.
 
 import { buildMcap, DvrRecord, DvrSchema } from "./buildMcap";
-import { ClipMeta, ClipTrigger } from "./clipTypes";
+import { ClipMeta, ClipTrigger, PanelTrigger } from "./clipTypes";
 import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
 import { ClipStore, ClipStoreMode } from "./opfsStore";
 import { resolveSchema } from "./schemaRegistry";
@@ -96,6 +96,8 @@ export type CaptureEngineDeps = {
   /** MCAP framer. Defaults to `buildMcap`; tests inject a stub for exact byte sizes. */
   frame?: FrameFn;
   mirrorIntervalMs?: number;
+  /** Retry backoff. Injected so tests do not wait on real timers. */
+  delay?: (ms: number) => Promise<void>;
 };
 
 /** Per topic: a real schema resolved from the registry, or an inferred, merged one. */
@@ -105,8 +107,15 @@ const TRIGGER_LABELS: Record<Exclude<ClipTrigger, "gap">, string> = {
   backgrounded: "backgrounded",
   closing: "closing",
   "manual-clip": "manual",
+  rotation: "auto-save",
   recovered: "recovered",
 };
+
+/**
+ * Backoff before retrying a failed rehydrate step. The usual cause is OPFS exclusive-lock
+ * contention with a worker that is still shutting down, which clears in milliseconds.
+ */
+const REHYDRATE_RETRY_DELAYS_MS = [50, 250];
 
 export class CaptureEngine {
   readonly #store: ClipStore;
@@ -114,6 +123,7 @@ export class CaptureEngine {
   readonly #emit: (message: EngineOutput, transfer?: Transferable[]) => void;
   readonly #frame: FrameFn;
   readonly #mirrorIntervalMs: number;
+  readonly #delay: (ms: number) => Promise<void>;
   readonly #encoder = new TextEncoder();
 
   // --- live ring ---
@@ -160,6 +170,11 @@ export class CaptureEngine {
     this.#emit = deps.emit;
     this.#frame = deps.frame ?? buildMcap;
     this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
+    this.#delay =
+      deps.delay ??
+      (async (ms: number) => {
+        await new Promise<void>((resolve) => setTimeout(resolve, ms));
+      });
     this.#lastMirrorAt = deps.now();
   }
 
@@ -182,12 +197,47 @@ export class CaptureEngine {
         this.#broadcastClips();
         return;
       }
-      this.#clips = await this.#store.listClips();
-      this.#seq = this.#clips.length;
-      await this.#promoteOrphanMirrors();
-      await this.#evictToCap();
+      // Every step below is individually guarded, and the broadcast happens either way.
+      // A throw part-way through used to skip it entirely, leaving the panel showing its
+      // empty initial list until the next mutation — cached clips looked lost.
+      const listed = await this.#attempt(
+        "read the cached clips",
+        async () => await this.#store.listClips(),
+      );
+      if (listed != undefined) {
+        this.#clips = listed;
+        this.#seq = this.#clips.length;
+      }
+      await this.#attempt("recover the previous session", async () => {
+        await this.#promoteOrphanMirrors();
+      });
+      await this.#attempt("apply the clip cache limit", async () => {
+        await this.#evictToCap();
+      });
       this.#broadcastClips();
     });
+  }
+
+  /**
+   * Run one rehydrate step, retrying briefly before giving up, and never throwing. The
+   * failure this defends against is transient: OPFS grants exclusive file access, so a
+   * worker that is still shutting down can hold a mirror while the new one starts reading.
+   * On permanent failure the caller keeps whatever it already has.
+   */
+  async #attempt<T>(what: string, operation: () => Promise<T>): Promise<T | undefined> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await operation();
+      } catch (err) {
+        const backoffMs = REHYDRATE_RETRY_DELAYS_MS[attempt];
+        if (backoffMs == undefined) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.#emit({ type: "error", message: `Could not ${what}: ${reason}` });
+          return undefined;
+        }
+        await this.#delay(backoffMs);
+      }
+    }
   }
 
   /**
@@ -321,7 +371,7 @@ export class CaptureEngine {
   }
 
   /** Snapshot the current ring into a durable clip. Never clears the ring. */
-  public createClip(trigger: Exclude<ClipTrigger, "gap">): void {
+  public createClip(trigger: PanelTrigger): void {
     this.#requestClip(trigger, TRIGGER_LABELS[trigger]);
   }
 
@@ -396,16 +446,28 @@ export class CaptureEngine {
   // --- clips -----------------------------------------------------------------------
 
   #requestClip(trigger: ClipTrigger, label: string): void {
-    if (!this.#requireCache()) {
-      return;
-    }
     if (this.#records.length === 0) {
       return; // nothing worth writing
     }
     // Freeze the window synchronously, exactly like an auto-save rotation does, so a slow
     // build cannot capture a window that has moved on. The ring itself is untouched.
-    const snapshot = this.#records.slice();
-    const schemas = this.#snapshotSchemaMap();
+    this.#cacheSnapshot(this.#records.slice(), this.#snapshotSchemaMap(), trigger, label);
+  }
+
+  /**
+   * Frame an already-frozen window and write it to the durable cache. Separate from
+   * {@link CaptureEngine.#requestClip} because an auto-save rotation has to hand over a
+   * snapshot it has *already* cleared from the live ring.
+   */
+  #cacheSnapshot(
+    snapshot: readonly DvrRecord[],
+    schemas: Map<string, DvrSchema>,
+    trigger: ClipTrigger,
+    label: string,
+  ): void {
+    if (!this.#requireCache() || snapshot.length === 0) {
+      return;
+    }
     this.#enqueueCacheOp(async () => {
       const bytes = await this.#frame(snapshot, schemas);
       const meta = this.#buildMeta(snapshot, bytes.byteLength, {
@@ -457,15 +519,35 @@ export class CaptureEngine {
       }
     }
     if (promoted > 0) {
+      await this.#pruneRecovered();
       this.#clips = await this.#store.listClips();
     }
   }
 
   /**
-   * Drop whole oldest clips until the cache is back under the cap. Returns whether
-   * anything was removed. The live ring and the mirror are never touched, and the newest
-   * clip is always kept — a single clip larger than the cap stays rather than being
-   * written and instantly deleted.
+   * Recovery is a single rolling slot. Every reload and reconnect promotes the previous
+   * worker's mirror, so without this the cache fills with `recovered` clips and the cap
+   * starts dropping the clips the user actually asked for.
+   */
+  async #pruneRecovered(): Promise<void> {
+    const recovered = (await this.#store.listClips()).filter(
+      (clip) => clip.trigger === "recovered",
+    );
+    // listClips is oldest first, so everything but the last is superseded.
+    for (const clip of recovered.slice(0, -1)) {
+      await this.#store.deleteClip(clip.id);
+    }
+  }
+
+  /**
+   * Drop whole clips until the cache is back under the cap. Returns whether anything was
+   * removed. The live ring and the mirror are never touched, and at least one clip is
+   * always kept — a single clip larger than the cap stays rather than being written and
+   * instantly deleted.
+   *
+   * Order is oldest-first, except that `recovered` clips go before anything the user asked
+   * for however new they are. Recovery is churn produced by reconnects, so it must never
+   * cost a `gap`, `manual`, or auto-save window.
    */
   async #evictToCap(): Promise<boolean> {
     const cap = this.#maxCacheBytes;
@@ -473,15 +555,17 @@ export class CaptureEngine {
       return false;
     }
     let total = await this.#store.totalClipBytes();
-    const oldestFirst = await this.#store.listClips();
+    const clips = await this.#store.listClips();
+    const victims = [...clips].sort(compareEvictionOrder);
+    let remaining = clips.length;
     let evicted = false;
-    while (total > cap && oldestFirst.length > 1) {
-      const victim = oldestFirst.shift();
-      if (victim == undefined) {
+    for (const victim of victims) {
+      if (total <= cap || remaining <= 1) {
         break;
       }
       await this.#store.deleteClip(victim.id);
       total -= victim.byteSize;
+      remaining--;
       evicted = true;
     }
     if (evicted) {
@@ -682,6 +766,12 @@ export class CaptureEngine {
       this.#byteTotal = 0;
       this.#rotations++;
       this.#mirroredMessageCount = -1;
+      // Cache the window first. Rotation has already dropped it from the live ring, so if
+      // the folder write cannot complete there is nothing left to fall back on: a folder's
+      // read-write grant lapses to "prompt" across a page load, and this code path has no
+      // user gesture, so it can only query the grant and must pause. The cache is the
+      // guarantee; the folder write below is opportunistic.
+      this.#cacheSnapshot(snapshot, snapshotSchemas, "rotation", TRIGGER_LABELS.rotation);
       this.#flushRotation(snapshot, snapshotSchemas);
       this.#postStat();
       return true;
@@ -780,6 +870,16 @@ export class CaptureEngine {
       await operation();
     });
   }
+}
+
+/** Eviction order: `recovered` clips first, then oldest first. */
+function compareEvictionOrder(a: ClipMeta, b: ClipMeta): number {
+  const aRank = a.trigger === "recovered" ? 0 : 1;
+  const bRank = b.trigger === "recovered" ? 0 : 1;
+  if (aRank !== bRank) {
+    return aRank - bRank;
+  }
+  return a.createdAt - b.createdAt;
 }
 
 function toNanos(time?: Time): bigint {
