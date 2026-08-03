@@ -80,6 +80,9 @@ function buttonStyle(
     fontWeight: 500,
     lineHeight: 1.2,
     borderRadius: 0,
+    // Panels can be narrow; let a button row wrap rather than breaking a label
+    // across lines ("Save / to / disk").
+    whiteSpace: "nowrap",
     cursor: disabled ? "default" : "pointer",
     opacity: disabled ? 0.5 : 1,
     transition: "background 0.15s ease, color 0.15s ease",
@@ -392,8 +395,9 @@ function cacheModeLabel(cache: CacheStatus): string {
 function sectionTitleStyle(theme: Theme): React.CSSProperties {
   return {
     display: "flex",
+    flexWrap: "wrap",
     alignItems: "baseline",
-    gap: "0.5rem",
+    gap: "0.15rem 0.5rem",
     margin: "0 0 0.4rem",
     paddingBottom: "0.25rem",
     borderBottom: `1px solid ${theme.border}`,
@@ -430,17 +434,15 @@ function ClipRow({
   onCancelDelete,
 }: ClipRowProps): React.JSX.Element {
   const topicCounts = Object.entries(clip.topicCounts).sort((a, b) => a[0].localeCompare(b[0]));
+  // Two lines rather than one wide row: a panel is often only a few hundred pixels wide,
+  // and five columns plus two controls on one line squeezes every label.
   return (
-    <div style={{ borderTop: `1px solid ${theme.border}`, padding: "0.3rem 0" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+    <div style={{ borderTop: `1px solid ${theme.border}`, padding: "0.35rem 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
         <ThemedButton theme={theme} variant="link" onClick={onToggleExpand}>
           {expanded ? "▾" : "▸"}
         </ThemedButton>
-        <span style={{ fontWeight: 600, minWidth: "5.5rem" }}>{clip.triggerLabel}</span>
-        <span style={{ color: theme.muted }}>{formatClock(clip.createdAt)}</span>
-        <span style={{ color: theme.muted }}>{formatDurationSec(clip.durationSec)}</span>
-        <span style={{ color: theme.muted }}>{formatBytes(clip.byteSize)}</span>
-        <span style={{ color: theme.muted }}>{clip.messageCount} msgs</span>
+        <span style={{ fontWeight: 600, wordBreak: "break-word" }}>{clip.triggerLabel}</span>
         <span style={{ flex: "1 1 auto" }} />
         {confirmingDelete ? (
           <>
@@ -463,12 +465,27 @@ function ClipRow({
           </>
         )}
       </div>
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          columnGap: "0.75rem",
+          margin: "0 0 0 1.5rem",
+          color: theme.muted,
+          fontSize: "0.75rem",
+        }}
+      >
+        <span>{formatClock(clip.createdAt)}</span>
+        <span>{formatDurationSec(clip.durationSec)}</span>
+        <span>{formatBytes(clip.byteSize)}</span>
+        <span>{clip.messageCount} msgs</span>
+      </div>
       {expanded && (
         <div
           style={{
             display: "grid",
             rowGap: "0.1rem",
-            margin: "0.25rem 0 0.35rem 1.6rem",
+            margin: "0.3rem 0 0.35rem 1.5rem",
             fontSize: "0.75rem",
           }}
         >
@@ -476,7 +493,10 @@ function ClipRow({
             <span style={{ color: theme.muted }}>No topics recorded.</span>
           ) : (
             topicCounts.map(([topic, count]) => (
-              <div key={topic} style={{ display: "flex", justifyContent: "space-between" }}>
+              <div
+                key={topic}
+                style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem" }}
+              >
                 <span style={{ color: theme.muted, wordBreak: "break-all" }}>{topic}</span>
                 <span>{count}</span>
               </div>
@@ -940,7 +960,13 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       </p>
 
       <div
-        style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.85rem" }}
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: "0.5rem",
+          marginBottom: "0.85rem",
+        }}
       >
         <ThemedButton
           theme={theme}
@@ -982,7 +1008,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
 
       <div style={sectionTitleStyle(theme)}>Current buffer</div>
 
-      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.6rem" }}>
         <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onSave}>
           Save to disk
         </ThemedButton>

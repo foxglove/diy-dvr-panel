@@ -39,7 +39,9 @@ const MIRROR_DIR = "mirror";
 const CLIP_EXT = ".mcap";
 const MIRROR_EXT = ".part";
 const META_EXT = ".json";
-const PROBE_NAME = ".probe";
+// Per instance, never a shared name: OPFS enforces exclusive file access, so two panels
+// probing one path would race and one of them would see NoModificationAllowedError.
+const PROBE_PREFIX = ".probe-";
 
 // --- Minimal declarations for OPFS APIs missing from the TS 5.1 DOM lib ------------
 // (Same approach as `FileSystemHandlePermissions` in DvrPanel.tsx: declare the shape
@@ -278,20 +280,24 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     init: async (): Promise<void> => {
       const { root, clips } = await dirs();
       try {
-        // Enumeration backs both the clip list and orphan-mirror discovery, so probe it
+        // Enumeration backs both the clip list and orphan-mirror discovery, so check it
         // here rather than failing later.
         await listNames(clips);
-        // A real write/read/delete round trip resolves sync-vs-async up front, so the
-        // panel can report the live mode from its very first clip broadcast.
-        await writeFile(root, PROBE_NAME, new Uint8Array([1]));
-        const back = await readFile(root, PROBE_NAME);
-        if (back?.byteLength !== 1) {
-          throw new Error("OPFS probe did not read back");
-        }
-        await removeIfPresent(root, PROBE_NAME);
       } catch (err) {
         mode = "unavailable";
         throw err instanceof Error ? err : new Error(String(err));
+      }
+      // A real write/read/delete round trip resolves sync-vs-async up front, so the panel
+      // can report the live mode from its very first clip broadcast. Best effort only: the
+      // directories are already known good, so a probe failure must not disable the cache
+      // — it just leaves the mode unresolved until the first real write.
+      const probeName = PROBE_PREFIX + ownId;
+      try {
+        await writeFile(root, probeName, new Uint8Array([1]));
+        await readFile(root, probeName);
+        await removeIfPresent(root, probeName);
+      } catch {
+        // Leave `mode` unresolved and carry on; the cache itself is fine.
       }
     },
 
