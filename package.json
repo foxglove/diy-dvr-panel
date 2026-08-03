@@ -9,7 +9,7 @@
     "url": "git+https://github.com/foxglove/diy-dvr-panel.git"
   },
   "bugs": "https://github.com/foxglove/diy-dvr-panel/issues",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "license": "MIT",
   "main": "./dist/extension.js",
   "keywords": ["dvr", "recording", "buffer", "mcap", "websocket", "live"],
