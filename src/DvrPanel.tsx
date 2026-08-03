@@ -540,6 +540,9 @@ function CacheMeter({
       <div
         style={{
           width: `${(ratio * 100).toFixed(1)}%`,
+          // A large cap makes early usage round to a hair; keep it visible so the meter
+          // reads as "a little used" rather than as an empty or broken bar.
+          minWidth: usedBytes > 0 ? "2px" : 0,
           height: "100%",
           background: meterColor(theme, ratio),
           transition: "width 0.3s ease, background 0.3s ease",
@@ -714,6 +717,27 @@ function ClipRow({
       )}
     </div>
   );
+}
+
+/**
+ * The pinned one-liner. Being subscribed to topics is not the same as receiving data, so
+ * this does not claim to be recording until something is actually buffered — the headline
+ * state has to be honest about a source that is connected but silent.
+ */
+function bufferStatus(
+  stat: WorkerStat,
+  flags: { workerReady: boolean; enabledTopics: number },
+): { label: string; active: boolean } {
+  if (!flags.workerReady) {
+    return { label: "Starting…", active: false };
+  }
+  if (flags.enabledTopics === 0) {
+    return { label: "No topics selected", active: false };
+  }
+  if (stat.bufferedMsgs === 0) {
+    return { label: "Waiting for data", active: false };
+  }
+  return { label: "Recording", active: true };
 }
 
 function statSummary(stat: WorkerStat, config: DvrConfig): { used: string; cap: string } {
@@ -1146,6 +1170,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const hasClips = clips.length > 0;
 
   const hasBuffer = stat.bufferedMsgs > 0;
+  const status = bufferStatus(stat, { workerReady, enabledTopics: enabledTopics.length });
   const capBytes = Math.round(config.maxCacheMb * 1024 * 1024);
   const fillStyle: React.CSSProperties = { flex: `1 1 120px` };
 
@@ -1166,7 +1191,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       style={{
         height: "100%",
         overflowY: "auto",
-        padding: "0.75rem",
+        // No top padding: it belongs to the sticky zone below, so that zone can pin flush
+        // with the top of the scroll area. Left here, scrolled content would slide through
+        // the gap above it.
+        padding: "0 0.75rem 0.75rem",
         boxSizing: "border-box",
         fontFamily: "inherit",
         fontSize: "0.8125rem",
@@ -1185,9 +1213,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           top: 0,
           zIndex: 1,
           background: theme.bg,
-          // Bleed over the container padding so scrolled content cannot appear beside it.
+          // Bleed over the container's side padding, and carry the top padding itself, so
+          // the opaque background covers every pixel scrolled content could pass through.
           margin: "0 -0.75rem",
-          padding: "0 0.75rem 0.5rem",
+          padding: "0.75rem 0.75rem 0.5rem",
         }}
       >
         <div
@@ -1268,15 +1297,14 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             alignItems: "baseline",
             gap: "0.4rem",
             marginTop: "0.5rem",
-            color: captureOn ? theme.fg : theme.muted,
+            color: status.active ? theme.fg : theme.muted,
           }}
         >
-          <span aria-hidden style={{ color: captureOn ? theme.success : theme.muted }}>
+          <span aria-hidden style={{ color: status.active ? theme.success : theme.muted }}>
             ●
           </span>
           <span>
-            {captureOn ? "Recording" : workerReady ? "Idle" : "Starting…"} — {budget.used} /{" "}
-            {budget.cap}
+            {status.label} — {budget.used} / {budget.cap}
           </span>
         </div>
       </div>

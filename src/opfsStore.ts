@@ -92,6 +92,11 @@ export type ClipStore = {
   init: () => Promise<void>;
   /** Which access path is live, for display in the panel. */
   mode: () => ClipStoreMode;
+  /**
+   * Identifies this worker instance. The cache is shared by every panel at the origin, so
+   * callers must fold this into any name they invent to stay collision-free.
+   */
+  instanceId: () => string;
   writeClip: (meta: ClipMeta, bytes: Uint8Array) => Promise<void>;
   /** Cached clips, oldest first. Clips with a missing payload or sidecar are skipped. */
   listClips: () => Promise<ClipMeta[]>;
@@ -303,6 +308,8 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
 
     mode: (): ClipStoreMode => mode,
 
+    instanceId: (): string => ownId,
+
     writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
       const { clips } = await dirs();
       await writeFile(clips, meta.id + CLIP_EXT, bytes);
@@ -351,9 +358,14 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
         if (entry.id === ownId) {
           continue; // our own live mirror
         }
-        const bytes = await readFile(mirror, entry.id + MIRROR_EXT);
-        if (bytes != undefined) {
-          orphans.push({ instanceId: entry.id, meta: entry.meta, bytes });
+        try {
+          const bytes = await readFile(mirror, entry.id + MIRROR_EXT);
+          if (bytes != undefined) {
+            orphans.push({ instanceId: entry.id, meta: entry.meta, bytes });
+          }
+        } catch {
+          // Unreadable, typically because a live panel holds the file. Skip it rather than
+          // failing the whole rehydrate; the cached clips still load.
         }
       }
       return orphans.sort((a, b) => compareByCreation(a.meta, b.meta));

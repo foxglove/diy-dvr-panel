@@ -33,6 +33,11 @@ export type FakeStoreOptions = {
   failInit?: boolean;
   /** Make `writeClip()` reject, as a quota failure would. */
   failWrites?: boolean;
+  /**
+   * Mirrors that cannot be deleted, as OPFS reports while another worker holds the file.
+   * Keyed by owning instance id.
+   */
+  lockedMirrors?: Set<string>;
 };
 
 /** A `ClipStore` over an in-memory backing. Deep-copies bytes, like a real filesystem. */
@@ -54,6 +59,7 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
       }
     },
     mode: (): ClipStoreMode => (opts.failInit === true ? "unavailable" : mode),
+    instanceId: (): string => instanceId,
     writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
       if (opts.failWrites === true) {
         throw new Error("fake quota exceeded");
@@ -84,7 +90,11 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
       return orphans;
     },
     clearMirror: async (target?: string): Promise<void> => {
-      backing.mirrors.delete(target ?? instanceId);
+      const id = target ?? instanceId;
+      if (opts.lockedMirrors?.has(id) === true) {
+        throw new Error(`fake OPFS: ${id} mirror is locked by its owner`);
+      }
+      backing.mirrors.delete(id);
     },
   };
 }

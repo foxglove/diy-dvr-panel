@@ -123,6 +123,8 @@ export class CaptureEngine {
   readonly #schemaByTopic = new Map<string, TopicSchema>();
   #messageCount = 0;
   #rotations = 0;
+  /** Message count at the last emitted stat, so `tick()` only reports real changes. */
+  #lastStatMessageCount = -1;
 
   // --- config (unbounded / no auto-save until the first `configure`) ---
   #budgetMode: "time" | "bytes" = "time";
@@ -286,6 +288,11 @@ export class CaptureEngine {
   public tick(): void {
     this.#checkGap();
     this.#maybeMirror();
+    // Message-count-triggered stats alone can lag badly on a slow feed, and the panel
+    // pins a live buffer status, so also report on the tick whenever something changed.
+    if (this.#messageCount !== this.#lastStatMessageCount) {
+      this.#postStat();
+    }
   }
 
   /** Non-destructive: frame the current window and hand the bytes to the panel. */
@@ -423,8 +430,20 @@ export class CaptureEngine {
    */
   async #promoteOrphanMirrors(): Promise<void> {
     const orphans = await this.#store.listOrphanMirrors();
+    let promoted = 0;
     for (const orphan of orphans) {
+      // Claim it before promoting. Deleting the mirror is also the test for whether its
+      // owner is really gone: OPFS locks a file while a worker is writing it, so a failure
+      // here means a live panel still owns this mirror and we must not duplicate its
+      // backstop. Clearing first is safe because the bytes are already in hand.
+      try {
+        await this.#store.clearMirror(orphan.instanceId);
+      } catch {
+        continue;
+      }
       if (orphan.meta.messageCount >= 1) {
+        // An empty mirror has nothing to promote, but is still cleared above so it is not
+        // reconsidered on the next mount.
         const meta: ClipMeta = {
           ...orphan.meta,
           id: this.#nextClipId(),
@@ -434,12 +453,10 @@ export class CaptureEngine {
           sealed: true,
         };
         await this.#store.writeClip(meta, orphan.bytes);
+        promoted++;
       }
-      // Clear it either way: an empty mirror has nothing to promote and should not be
-      // reconsidered on the next mount.
-      await this.#store.clearMirror(orphan.instanceId);
     }
-    if (orphans.length > 0) {
+    if (promoted > 0) {
       this.#clips = await this.#store.listClips();
     }
   }
@@ -500,9 +517,16 @@ export class CaptureEngine {
     };
   }
 
+  /**
+   * Clip ids double as OPFS filenames in a cache shared by every panel at the origin, so
+   * they carry this worker's instance id. Without it two panels reacting to the same event
+   * in the same millisecond derive the same id — both seed `#seq` from the same clip count
+   * — and collide on one file, which OPFS rejects outright. The sequence number is padded
+   * so ids from a single millisecond still sort in creation order.
+   */
   #nextClipId(): string {
     const seq = this.#seq++;
-    return `clip-${this.#now()}-${seq}`;
+    return `clip-${this.#now()}-${String(seq).padStart(4, "0")}-${this.#store.instanceId()}`;
   }
 
   #broadcastClips(): void {
@@ -710,6 +734,7 @@ export class CaptureEngine {
   // --- plumbing --------------------------------------------------------------------
 
   #postStat(): void {
+    this.#lastStatMessageCount = this.#messageCount;
     this.#emit(this.stats());
   }
 

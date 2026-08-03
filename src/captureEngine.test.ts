@@ -134,6 +134,32 @@ describe("live ring buffer", () => {
     expect(stats.newestNanos).toBe(nanosOf(102).toString());
   });
 
+  it("reports a stat on the tick when the buffer changed, and only then", () => {
+    // The panel pins a live buffer status, and the every-200-messages cadence alone can
+    // lag for minutes on a slow feed.
+    const { engine, out } = harness();
+    engine.configure(config());
+    out.clear();
+
+    engine.tick();
+    expect(out.all("stat")).toHaveLength(0);
+
+    engine.addMessage(makeMsg("/a", 100));
+    engine.tick();
+    expect(out.all("stat")).toHaveLength(1);
+    expect(out.last("stat")?.bufferedMsgs).toBe(1);
+
+    // Nothing new arrived, so there is nothing to report.
+    engine.tick();
+    engine.tick();
+    expect(out.all("stat")).toHaveLength(1);
+
+    engine.addMessage(makeMsg("/a", 101));
+    engine.tick();
+    expect(out.all("stat")).toHaveLength(2);
+    expect(out.last("stat")?.bufferedMsgs).toBe(2);
+  });
+
   it("frames the current window on save without clearing it", async () => {
     const { engine, out } = harness();
     engine.configure(config());
@@ -342,6 +368,33 @@ describe("durability across a worker teardown", () => {
     expect(broadcast?.cache).toEqual({ available: true, mode: "async" });
   });
 
+  it("never derives the same clip id in two workers sharing the cache", async () => {
+    // Two DIY DVR panels in one layout share the origin's cache, and both react to the
+    // same event at the same instant from the same clip count. Ids must still differ, or
+    // they collide on one file — which OPFS rejects and which would lose a clip.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    const a = harness({ backing, clock, storeOptions: { instanceId: "worker-a" } });
+    const b = harness({ backing, clock, storeOptions: { instanceId: "worker-b" } });
+    for (const panel of [a, b]) {
+      panel.engine.start();
+      panel.engine.configure(config());
+      panel.engine.addMessage(makeMsg("/a", 100));
+    }
+    await a.engine.whenIdle();
+    await b.engine.whenIdle();
+
+    // Same trigger, same millisecond, same starting sequence number.
+    a.engine.createClip("backgrounded");
+    b.engine.createClip("backgrounded");
+    await a.engine.whenIdle();
+    await b.engine.whenIdle();
+
+    const ids = storedClips(backing).map((clip) => clip.id);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+  });
+
   it("promotes an un-sealed mirror left behind by a dead worker", async () => {
     const backing = createFakeBacking();
     backing.mirrors.set("dead-worker", {
@@ -382,6 +435,32 @@ describe("durability across a worker teardown", () => {
 
     expect(backing.clips.size).toBe(0);
     expect(backing.mirrors.size).toBe(0);
+  });
+
+  it("leaves a mirror it cannot claim to its live owner", async () => {
+    // Two panels share the origin's cache. A mirror that cannot be deleted is still held
+    // by a running worker, so promoting it would duplicate a live panel's backstop.
+    const backing = createFakeBacking();
+    backing.mirrors.set("live-sibling", {
+      meta: makeMirrorMeta({ messageCount: 4 }),
+      bytes: new Uint8Array([1, 2]),
+    });
+
+    const { engine, out } = harness({
+      backing,
+      storeOptions: {
+        instanceId: "this-worker",
+        lockedMirrors: new Set(["live-sibling"]),
+      },
+    });
+    engine.start();
+    await engine.whenIdle();
+
+    expect(backing.clips.size).toBe(0);
+    expect(backing.mirrors.has("live-sibling")).toBe(true);
+    // Contention is expected here, not something to alarm the user about.
+    expect(out.all("error")).toHaveLength(0);
+    expect(out.last("clips")?.cache.available).toBe(true);
   });
 
   it("leaves its own live mirror alone", async () => {
