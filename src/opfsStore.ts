@@ -5,9 +5,8 @@
 // and discards its in-memory buffer. OPFS lives at the origin and outlives any single
 // worker, so clips written here survive that teardown and are re-read on the next mount.
 //
-// Shape mirrors `fsStore.ts`: a few small private helpers plus a narrow exported surface.
-// Unlike `fsStore.ts` (which persists one structured-cloneable handle in IndexedDB) this
-// module owns real files, so it is returned as an injectable `ClipStore` object — the
+// A few small private helpers behind a narrow exported surface. The module owns real files
+// rather than a single value, so it is returned as an injectable `ClipStore` object — the
 // capture engine takes one, and the unit tests pass an in-memory fake instead.
 //
 // Layout, all under a `diy-dvr` root so we never touch anything else at the origin:

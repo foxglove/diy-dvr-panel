@@ -11,7 +11,7 @@ Record data from a live [Foxglove](https://foxglove.dev) WebSocket connection to
 - **Bounded clip cache** — clips are capped by total size; the oldest are dropped first.
 - **Save on demand** — write the current buffer to an `.mcap` file at any time.
 - **Auto-save** — automatically write each window to a file as the limit is reached, so nothing is dropped.
-- **Choose a save folder** — pick a folder once and saves land there silently, with no per-file dialog.
+- **Choose a save folder** — pick a folder and saves land there silently, with no per-file dialog. The browser only grants folder access for the current session, so the destination starts at your Downloads folder each time the app loads and you pick a folder again to resume silent saving.
 - Works in both the **desktop and web** apps.
 
 ## Usage
@@ -25,7 +25,7 @@ Record data from a live [Foxglove](https://foxglove.dev) WebSocket connection to
 
 > **Cached clips** are the answer to "the data I wanted disappeared when the connection dropped". The app restarts the panel when the live connection changes, which throws the in-memory buffer away — so the panel also keeps clips, and a rolling backup of the current buffer, in browser storage at the origin. That storage outlives the restart, and anything left behind by an interrupted session is recovered as a clip the next time the panel loads.
 
-> **Silent saving** (no save dialog on every file) requires a Chromium-based build — the desktop app, or Chrome / Edge for the web app. Choose a save folder in Settings to enable it; otherwise files are saved as browser downloads.
+> **Silent saving** (no save dialog on every file) requires a Chromium-based build — the desktop app, or Chrome / Edge for the web app. Choose a save folder in Settings to enable it for the session; otherwise files are saved as browser downloads.
 
 ## Development
 

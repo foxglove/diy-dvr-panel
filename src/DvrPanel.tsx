@@ -4,7 +4,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createRoot } from "react-dom/client";
 
 import { ClipMeta } from "./clipTypes";
-import { clearDirHandle, loadDirHandle, saveDirHandle } from "./fsStore";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { SaveResult, SaveStatus, statusFromResult } from "./saveStatus";
 import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
@@ -264,6 +263,22 @@ type FileSystemHandlePermissions = {
 // Silent save (directory picker) is Chromium-only. Elsewhere we fall back to a blob
 // download. Computed once at module scope so it is not an effect dependency.
 const canPickDir = typeof window !== "undefined" && "showDirectoryPicker" in window;
+
+/**
+ * The chosen save folder, held for the life of the *page* instead of being persisted.
+ *
+ * Chromium grants a directory's read-write permission for the current session only and
+ * drops it back to "prompt" on the next page load. A handle restored from storage would
+ * therefore present a folder as the active destination while every save to it silently
+ * paused — the same lapsed grant behind the auto-save data loss. Module scope has exactly
+ * the right lifetime: it survives the panel remount the app performs on a reconnect (where
+ * the grant is still live, so the folder should be kept) and is empty again after a reload,
+ * so every page load starts at "Browser download" until the user picks a folder. Picking it
+ * is the gesture that re-grants access for the session.
+ *
+ * Shared by every DIY DVR panel in the page, which is how the folder already behaved.
+ */
+let sessionDirHandle: FileSystemDirectoryHandle | undefined;
 
 type WorkerStat = {
   messageCount: number;
@@ -878,32 +893,19 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     };
   }, []);
 
-  // Restore a previously-picked save folder on mount. The handle persists in
-  // IndexedDB across remounts/reloads; we only restore it here (no requestPermission
-  // without a user gesture) — permission is re-verified lazily at save time.
+  // Pick up a folder chosen earlier in this page session (the app remounts the panel on a
+  // reconnect, and the grant is still live then). After a reload there is nothing to pick
+  // up, so the destination starts at "Browser download" — see `sessionDirHandle`.
   useEffect(() => {
-    if (!canPickDir) {
+    if (!canPickDir || sessionDirHandle == undefined) {
       return;
     }
-    const active = { current: true };
-    void (async () => {
-      try {
-        const handle = await loadDirHandle();
-        if (active.current && handle != undefined) {
-          dirHandleRef.current = handle;
-          setSaveFolderName(handle.name);
-        }
-      } catch (err) {
-        console.error("[diy-dvr] failed to load saved folder", err);
-      }
-    })();
-    return () => {
-      active.current = false;
-    };
+    dirHandleRef.current = sessionDirHandle;
+    setSaveFolderName(sessionDirHandle.name);
   }, []);
 
-  // Open the directory picker (shared by the sidebar action and the in-body button)
-  // and persist the chosen handle to IndexedDB so it survives remounts/reloads.
+  // Open the directory picker (shared by the sidebar action and the in-body button) and
+  // keep the chosen handle for the rest of the page session.
   const chooseSaveFolder = useCallback(() => {
     void (async () => {
       try {
@@ -924,26 +926,20 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           return; // leave the previous handle / browser-download in place
         }
         dirHandleRef.current = handle;
+        sessionDirHandle = handle;
         setSaveFolderName(handle.name);
-        try {
-          await saveDirHandle(handle);
-        } catch (err) {
-          console.error("[diy-dvr] failed to persist save folder", err);
-        }
       } catch {
         // user cancelled the picker — leave the existing handle in place
       }
     })();
   }, []);
 
-  // Revert to browser-download saves and forget the stored folder. (Not a hook —
-  // named without a "use" prefix so it can be called from the settings action.)
+  // Revert to browser-download saves and forget the folder. (Not a hook — named without a
+  // "use" prefix so it can be called from the settings action.)
   const selectBrowserDownload = useCallback(() => {
     dirHandleRef.current = undefined;
+    sessionDirHandle = undefined;
     setSaveFolderName(undefined);
-    void clearDirHandle().catch((err: unknown) => {
-      console.error("[diy-dvr] failed to clear saved folder", err);
-    });
   }, []);
 
   // Forward every message from every subscribed topic to the worker.

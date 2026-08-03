@@ -87,6 +87,36 @@ describe("applyAction — existing nodes still behave", () => {
   });
 });
 
+describe("buildSettingsTree — save destination", () => {
+  it("defaults to browser download when no folder has been picked this session", () => {
+    // A directory's read-write grant lapses on every page load, so a folder is never the
+    // active destination until the user re-picks it. The panel therefore mounts with no
+    // folder name, and this is what the editor must show.
+    const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop, { canPickDir: true });
+    expect(tree.nodes.saving?.fields?.saveDestination).toMatchObject({ value: "download" });
+    // Auto-save is not even offered without a folder.
+    expect(tree.nodes.saving?.fields?.autoSave).toBeUndefined();
+    expect(tree.nodes.saving?.help).toContain("Choose a save folder");
+  });
+
+  it("offers the folder as the selected value once one is picked", () => {
+    const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop, {
+      canPickDir: true,
+      saveFolderName: "captures",
+    });
+    expect(tree.nodes.saving?.fields?.saveDestination).toMatchObject({ value: "current" });
+    expect(tree.nodes.saving?.fields?.autoSave).toMatchObject({ input: "boolean", value: false });
+  });
+
+  it("says downloads are the only option where silent save is unavailable", () => {
+    const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop, { canPickDir: false });
+    expect(tree.nodes.saving?.fields?.saveDestination).toMatchObject({
+      value: "Browser download",
+      readonly: true,
+    });
+  });
+});
+
 describe("buildSettingsTree", () => {
   it("emits a clip-cache node holding both fields", () => {
     const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop);
