@@ -1,0 +1,798 @@
+// The capture core: the rolling ring buffer, the durable clip cache, and everything
+// that decides when to snapshot. Extracted out of `mcap.worker.ts` so it holds no
+// `postMessage`, `self`, DOM, or timer references and can be unit-tested as plain
+// TypeScript in Node — the same reason `settings.ts` is kept pure.
+//
+// Everything the engine cannot do by itself is injected: the durable store
+// (`ClipStore`), the clock (`now`), the output sink (`emit`), and optionally the MCAP
+// framer (`frame`, defaults to `buildMcap`). `mcap.worker.ts` wires those to the real
+// OPFS store, `Date.now`, `postMessage`, and a 1 Hz `tick()`.
+//
+// Three concerns, deliberately kept separate:
+//
+//  1. The live ring — an in-memory FIFO bounded by the configured lookback. Unchanged
+//     behavior from before: it evicts the oldest record, or rotates the whole window
+//     when auto-save is on. Additionally mirrored to the store on a throttle as a
+//     crash-recovery backstop; the mirror never resets the ring.
+//  2. Clips — non-destructive snapshots of the ring written to the store when a trigger
+//     fires (a WS gap, the tab being hidden or closed, a manual request, or the
+//     promotion of a mirror left behind by a dead worker). Snapshotting never clears
+//     the ring.
+//  3. Cache eviction — after a clip is written, whole oldest clips are dropped until the
+//     total is back under the byte cap. The live ring and the mirror are never evicted.
+//
+// All store access runs through one serialized queue (`#enqueue`), so there is a single
+// writer, no overlapping builds, and deterministic ordering for the tests.
+
+import { buildMcap, DvrRecord, DvrSchema } from "./buildMcap";
+import { ClipMeta, ClipTrigger } from "./clipTypes";
+import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
+import { ClipStore, ClipStoreMode } from "./opfsStore";
+import { resolveSchema } from "./schemaRegistry";
+
+/** How often the live ring is mirrored to durable storage, unless overridden. */
+export const DEFAULT_MIRROR_INTERVAL_MS = 5000;
+
+export type Time = { sec: number; nsec: number };
+
+/** One decoded message forwarded from the panel's `onRender`. */
+export type EngineInboundMsg = {
+  topic: string;
+  schemaName?: string;
+  receiveTime?: Time;
+  publishTime?: Time;
+  message: unknown;
+};
+
+export type EngineConfig = {
+  budgetMode: "time" | "bytes";
+  budgetNanos?: bigint;
+  budgetBytes?: number;
+  autoSave: boolean;
+  enabledTopics: string[];
+  /** Total cap on cached clip bytes. Undefined leaves the cache unbounded. */
+  maxCacheBytes?: number;
+  /** Silence longer than this fires a `gap` clip. Zero or undefined disables it. */
+  gapMs?: number;
+};
+
+export type EngineStat = {
+  type: "stat";
+  messageCount: number;
+  channels: number;
+  bufferedMsgs: number;
+  byteTotal: number;
+  oldestNanos: string;
+  newestNanos: string;
+  rotations: number;
+};
+
+/** Whether the durable cache is usable, and which OPFS path is live. */
+export type CacheStatus = { available: boolean; mode: ClipStoreMode };
+
+export type EngineOutput =
+  | EngineStat
+  | {
+      type: "saved";
+      buffer: ArrayBuffer;
+      messageCount: number;
+      channels: number;
+      rotation: boolean;
+    }
+  | { type: "clips"; clips: ClipMeta[]; cache: CacheStatus }
+  | { type: "clipBytes"; id: string; meta: ClipMeta; buffer: ArrayBuffer }
+  | { type: "error"; message: string };
+
+export type FrameFn = (
+  records: readonly DvrRecord[],
+  schemaByTopic: ReadonlyMap<string, DvrSchema>,
+) => Promise<Uint8Array>;
+
+export type CaptureEngineDeps = {
+  store: ClipStore;
+  /** Wall-clock milliseconds. Injected so tests can drive time without real timers. */
+  now: () => number;
+  emit: (message: EngineOutput, transfer?: Transferable[]) => void;
+  /** MCAP framer. Defaults to `buildMcap`; tests inject a stub for exact byte sizes. */
+  frame?: FrameFn;
+  mirrorIntervalMs?: number;
+};
+
+/** Per topic: a real schema resolved from the registry, or an inferred, merged one. */
+type TopicSchema = { name: string; schema: JsonSchema; fromRegistry: boolean };
+
+const TRIGGER_LABELS: Record<Exclude<ClipTrigger, "gap">, string> = {
+  backgrounded: "backgrounded",
+  closing: "closing",
+  "manual-clip": "manual",
+  recovered: "recovered",
+};
+
+export class CaptureEngine {
+  readonly #store: ClipStore;
+  readonly #now: () => number;
+  readonly #emit: (message: EngineOutput, transfer?: Transferable[]) => void;
+  readonly #frame: FrameFn;
+  readonly #mirrorIntervalMs: number;
+  readonly #encoder = new TextEncoder();
+
+  // --- live ring ---
+  /** Kept sorted ascending by `logTime`, so the ends are always the window's min/max. */
+  readonly #records: DvrRecord[] = [];
+  #byteTotal = 0;
+  readonly #schemaByTopic = new Map<string, TopicSchema>();
+  #messageCount = 0;
+  #rotations = 0;
+
+  // --- config (unbounded / no auto-save until the first `configure`) ---
+  #budgetMode: "time" | "bytes" = "time";
+  #budgetNanos: bigint | undefined = undefined;
+  #budgetBytes: number | undefined = undefined;
+  #autoSave = false;
+  #enabledSet: Set<string> | undefined = undefined;
+  #maxCacheBytes: number | undefined = undefined;
+  #gapMs: number | undefined = undefined;
+
+  // --- clip cache ---
+  #clips: ClipMeta[] = [];
+  #cacheAvailable = true;
+  #warnedUnavailable = false;
+  #seq = 0;
+
+  // --- gap detection ---
+  #lastMessageAt: number | undefined = undefined;
+  #gapArmed = false;
+
+  // --- mirror throttle ---
+  #lastMirrorAt = 0;
+  #mirrorInFlight = false;
+  #mirroredMessageCount = -1;
+
+  /** Serializes every store operation: one writer, no overlapping builds. */
+  #queue: Promise<void> = Promise.resolve();
+
+  public constructor(deps: CaptureEngineDeps) {
+    this.#store = deps.store;
+    this.#now = deps.now;
+    this.#emit = deps.emit;
+    this.#frame = deps.frame ?? buildMcap;
+    this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
+  }
+
+  // --- lifecycle ------------------------------------------------------------------
+
+  /**
+   * Open the store, rehydrate the clip list, and promote any mirror a previous worker
+   * left behind. This is what makes clips survive an `initPanel` teardown: they live in
+   * OPFS, and the fresh worker reads them back.
+   */
+  public start(): void {
+    this.#enqueue(async () => {
+      try {
+        await this.#store.init();
+      } catch (err) {
+        // No durable cache here (an old build, a non-secure context, a denied quota).
+        // Live capture is unaffected, so report it and carry on.
+        this.#cacheAvailable = false;
+        this.#emitError(err);
+        this.#broadcastClips();
+        return;
+      }
+      this.#clips = await this.#store.listClips();
+      this.#seq = this.#clips.length;
+      await this.#promoteOrphanMirrors();
+      await this.#evictToCap();
+      this.#broadcastClips();
+    });
+  }
+
+  /**
+   * Drain the store queue. Used by the tests, and by anything that needs to know the
+   * durable side has settled. Loops because a queued operation can enqueue more work.
+   */
+  public async whenIdle(): Promise<void> {
+    let pending = this.#queue;
+    await pending;
+    while (pending !== this.#queue) {
+      pending = this.#queue;
+      await pending;
+    }
+  }
+
+  // --- inbound ---------------------------------------------------------------------
+
+  public configure(config: EngineConfig): void {
+    this.#budgetMode = config.budgetMode;
+    this.#budgetNanos = config.budgetNanos;
+    this.#budgetBytes = config.budgetBytes;
+    this.#autoSave = config.autoSave;
+    this.#enabledSet = new Set(config.enabledTopics);
+    this.#maxCacheBytes = config.maxCacheBytes;
+    this.#gapMs = config.gapMs;
+    // A newly-tightened budget may already be exceeded by the current buffer.
+    this.#enforceBudget();
+    this.#postStat();
+    // A newly-lowered cache cap should take effect without waiting for the next clip.
+    if (this.#cacheAvailable) {
+      this.#enqueueCacheOp(async () => {
+        const evicted = await this.#evictToCap();
+        if (evicted) {
+          this.#broadcastClips();
+        }
+      });
+    }
+  }
+
+  public addMessage(msg: EngineInboundMsg): void {
+    // Defensively drop messages for a topic that was just disabled but is still in
+    // flight (the panel already only subscribes to enabled topics).
+    const enabled = this.#enabledSet;
+    if (enabled != undefined && enabled.size > 0 && !enabled.has(msg.topic)) {
+      return;
+    }
+
+    // Any traffic re-arms the gap trigger.
+    this.#lastMessageAt = this.#now();
+    this.#gapArmed = true;
+
+    const name =
+      msg.schemaName != undefined && msg.schemaName.length > 0 ? msg.schemaName : msg.topic;
+    const existing = this.#schemaByTopic.get(msg.topic);
+    if (existing == undefined) {
+      // First message on this topic: prefer a real schema from the registry.
+      const registrySchema = name.length > 0 ? resolveSchema(name) : undefined;
+      this.#schemaByTopic.set(
+        msg.topic,
+        registrySchema
+          ? { name, schema: registrySchema, fromRegistry: true }
+          : { name, schema: rootSchema(msg.message), fromRegistry: false },
+      );
+    } else if (!existing.fromRegistry) {
+      // Unknown schema: keep refining the inferred shape as more messages arrive.
+      existing.schema = mergeJsonSchema(existing.schema, rootSchema(msg.message));
+    }
+
+    // Key the buffered/saved timeline off the message's published time (the source's own
+    // clock) when present, falling back to receive/wall time. This keeps the ring and the
+    // saved MCAP consistent even when arrival order differs from publish order.
+    const logTime = toNanos(msg.publishTime ?? msg.receiveTime);
+    const data = this.#encodeMessage(msg.message);
+    this.#insertRecord({
+      topic: msg.topic,
+      logTime,
+      publishTime: msg.publishTime != undefined ? toNanos(msg.publishTime) : logTime,
+      data,
+    });
+    this.#byteTotal += data.byteLength;
+    this.#messageCount++;
+
+    this.#enforceBudget();
+
+    if (this.#messageCount % 200 === 0) {
+      this.#postStat();
+    }
+  }
+
+  /**
+   * Periodic work the engine cannot schedule itself: the wall-clock gap check and the
+   * throttled mirror. The worker adapter calls this about once a second.
+   *
+   * Worker timers are throttled while a tab is in the background, so this can stall
+   * exactly when a gap would fire — which is why the panel also posts an explicit
+   * `backgrounded` trigger when the tab is hidden.
+   */
+  public tick(): void {
+    this.#checkGap();
+    this.#maybeMirror();
+  }
+
+  /** Non-destructive: frame the current window and hand the bytes to the panel. */
+  public save(): void {
+    const schemas = this.#snapshotSchemaMap();
+    this.#frame(this.#records, schemas)
+      .then((bytes) => {
+        this.#emitBuffer(bytes, "manual");
+      })
+      .catch((err: unknown) => {
+        this.#emitError(err);
+      });
+  }
+
+  /** Clear the live ring only. Cached clips are durable and are left alone. */
+  public reset(): void {
+    this.#records.length = 0;
+    this.#byteTotal = 0;
+    this.#schemaByTopic.clear();
+    this.#messageCount = 0;
+    this.#rotations = 0;
+    this.#mirroredMessageCount = -1;
+    this.#lastMessageAt = undefined;
+    this.#gapArmed = false;
+    this.#postStat();
+  }
+
+  /** Snapshot the current ring into a durable clip. Never clears the ring. */
+  public createClip(trigger: Exclude<ClipTrigger, "gap">): void {
+    this.#requestClip(trigger, TRIGGER_LABELS[trigger]);
+  }
+
+  public deleteClip(id: string): void {
+    if (!this.#requireCache()) {
+      return;
+    }
+    this.#enqueueCacheOp(async () => {
+      await this.#store.deleteClip(id);
+      this.#clips = await this.#store.listClips();
+      this.#broadcastClips();
+    });
+  }
+
+  public clearClips(): void {
+    if (!this.#requireCache()) {
+      return;
+    }
+    this.#enqueueCacheOp(async () => {
+      await this.#store.clearClips();
+      this.#clips = await this.#store.listClips();
+      this.#broadcastClips();
+    });
+  }
+
+  /** Read a cached clip back out so the panel can write it to disk. */
+  public requestClipBytes(id: string): void {
+    if (!this.#requireCache()) {
+      return;
+    }
+    this.#enqueueCacheOp(async () => {
+      const meta = this.#clips.find((clip) => clip.id === id);
+      const bytes = await this.#store.readClip(id);
+      if (meta == undefined || bytes == undefined) {
+        // Evicted or deleted between the broadcast and the click.
+        this.#emit({ type: "error", message: `Clip ${id} is no longer cached` });
+        this.#clips = await this.#store.listClips();
+        this.#broadcastClips();
+        return;
+      }
+      const buffer = toArrayBuffer(bytes);
+      this.#emit({ type: "clipBytes", id, meta, buffer }, [buffer]);
+    });
+  }
+
+  // --- read-only views (also used by the tests) ------------------------------------
+
+  public stats(): EngineStat {
+    const oldest = this.#records[0];
+    const newest = this.#records[this.#records.length - 1];
+    return {
+      type: "stat",
+      messageCount: this.#messageCount,
+      channels: this.#schemaByTopic.size,
+      bufferedMsgs: this.#records.length,
+      byteTotal: this.#byteTotal,
+      oldestNanos: (oldest?.logTime ?? 0n).toString(),
+      newestNanos: (newest?.logTime ?? 0n).toString(),
+      rotations: this.#rotations,
+    };
+  }
+
+  /** The live ring, oldest first. Read-only snapshot view. */
+  public bufferedRecords(): readonly DvrRecord[] {
+    return this.#records;
+  }
+
+  public cacheStatus(): CacheStatus {
+    return { available: this.#cacheAvailable, mode: this.#store.mode() };
+  }
+
+  // --- clips -----------------------------------------------------------------------
+
+  #requestClip(trigger: ClipTrigger, label: string): void {
+    if (!this.#requireCache()) {
+      return;
+    }
+    if (this.#records.length === 0) {
+      return; // nothing worth writing
+    }
+    // Freeze the window synchronously, exactly like an auto-save rotation does, so a slow
+    // build cannot capture a window that has moved on. The ring itself is untouched.
+    const snapshot = this.#records.slice();
+    const schemas = this.#snapshotSchemaMap();
+    this.#enqueueCacheOp(async () => {
+      const bytes = await this.#frame(snapshot, schemas);
+      const meta = this.#buildMeta(snapshot, bytes.byteLength, {
+        trigger,
+        triggerLabel: label,
+        sealed: true,
+      });
+      await this.#store.writeClip(meta, bytes);
+      this.#clips = await this.#store.listClips();
+      await this.#evictToCap();
+      this.#broadcastClips();
+    });
+  }
+
+  /**
+   * Promote every mirror left behind by another worker instance into a `recovered` clip.
+   *
+   * A crash and a silent reconnect teardown are mechanically indistinguishable — both
+   * leave an un-sealed mirror — so both are promoted. That is the point of the feature:
+   * it preserves the live buffer across the teardown this exists to defend against. The
+   * promoted clip can be up to one mirror interval stale.
+   */
+  async #promoteOrphanMirrors(): Promise<void> {
+    const orphans = await this.#store.listOrphanMirrors();
+    for (const orphan of orphans) {
+      if (orphan.meta.messageCount >= 1) {
+        const meta: ClipMeta = {
+          ...orphan.meta,
+          id: this.#nextClipId(),
+          trigger: "recovered",
+          triggerLabel: TRIGGER_LABELS.recovered,
+          createdAt: this.#now(),
+          sealed: true,
+        };
+        await this.#store.writeClip(meta, orphan.bytes);
+      }
+      // Clear it either way: an empty mirror has nothing to promote and should not be
+      // reconsidered on the next mount.
+      await this.#store.clearMirror(orphan.instanceId);
+    }
+    if (orphans.length > 0) {
+      this.#clips = await this.#store.listClips();
+    }
+  }
+
+  /**
+   * Drop whole oldest clips until the cache is back under the cap. Returns whether
+   * anything was removed. The live ring and the mirror are never touched, and the newest
+   * clip is always kept — a single clip larger than the cap stays rather than being
+   * written and instantly deleted.
+   */
+  async #evictToCap(): Promise<boolean> {
+    const cap = this.#maxCacheBytes;
+    if (cap == undefined) {
+      return false;
+    }
+    let total = await this.#store.totalClipBytes();
+    const oldestFirst = await this.#store.listClips();
+    let evicted = false;
+    while (total > cap && oldestFirst.length > 1) {
+      const victim = oldestFirst.shift();
+      if (victim == undefined) {
+        break;
+      }
+      await this.#store.deleteClip(victim.id);
+      total -= victim.byteSize;
+      evicted = true;
+    }
+    if (evicted) {
+      this.#clips = await this.#store.listClips();
+    }
+    return evicted;
+  }
+
+  #buildMeta(
+    snapshot: readonly DvrRecord[],
+    byteSize: number,
+    spec: { trigger: ClipTrigger; triggerLabel: string; sealed: boolean },
+  ): ClipMeta {
+    const topicCounts: Record<string, number> = {};
+    for (const record of snapshot) {
+      topicCounts[record.topic] = (topicCounts[record.topic] ?? 0) + 1;
+    }
+    const startNanos = snapshot[0]?.logTime ?? 0n;
+    const endNanos = snapshot[snapshot.length - 1]?.logTime ?? 0n;
+    const spanNanos = endNanos - startNanos;
+    return {
+      id: this.#nextClipId(),
+      trigger: spec.trigger,
+      triggerLabel: spec.triggerLabel,
+      startNanos: startNanos.toString(),
+      endNanos: endNanos.toString(),
+      durationSec: spanNanos > 0n ? Number(spanNanos) / 1e9 : 0,
+      byteSize,
+      messageCount: snapshot.length,
+      topicCounts,
+      createdAt: this.#now(),
+      sealed: spec.sealed,
+    };
+  }
+
+  #nextClipId(): string {
+    const seq = this.#seq++;
+    return `clip-${this.#now()}-${seq}`;
+  }
+
+  #broadcastClips(): void {
+    this.#emit({ type: "clips", clips: this.#clips, cache: this.cacheStatus() });
+  }
+
+  /** False when there is no durable cache; warns the panel once. */
+  #requireCache(): boolean {
+    if (this.#cacheAvailable) {
+      return true;
+    }
+    if (!this.#warnedUnavailable) {
+      this.#warnedUnavailable = true;
+      this.#emit({
+        type: "error",
+        message: "Clip cache unavailable — browser storage (OPFS) is not usable here",
+      });
+    }
+    return false;
+  }
+
+  // --- gap + mirror ----------------------------------------------------------------
+
+  #checkGap(): void {
+    const gapMs = this.#gapMs;
+    if (gapMs == undefined || gapMs <= 0) {
+      return; // trigger disabled
+    }
+    const lastMessageAt = this.#lastMessageAt;
+    if (lastMessageAt == undefined || !this.#gapArmed) {
+      return; // nothing received yet, or this gap already fired
+    }
+    if (this.#now() - lastMessageAt <= gapMs) {
+      return;
+    }
+    // Fire once per gap; the next message re-arms it.
+    this.#gapArmed = false;
+    this.#requestClip("gap", `gap>${Math.round(gapMs / 1000)}s`);
+  }
+
+  /**
+   * Write the live window to the store on a throttle, as an un-sealed mirror. This is
+   * the crash-recovery backstop for the window between clips; it never resets the ring.
+   */
+  #maybeMirror(): void {
+    if (!this.#cacheAvailable || this.#mirrorInFlight || this.#records.length === 0) {
+      return;
+    }
+    if (this.#messageCount === this.#mirroredMessageCount) {
+      return; // nothing new since the last mirror
+    }
+    if (this.#now() - this.#lastMirrorAt < this.#mirrorIntervalMs) {
+      return;
+    }
+    const snapshot = this.#records.slice();
+    const schemas = this.#snapshotSchemaMap();
+    const mirroredCount = this.#messageCount;
+    this.#mirrorInFlight = true;
+    this.#lastMirrorAt = this.#now();
+    // Unguarded `#enqueue` on purpose: the in-flight flag must be released even when the
+    // cache turned out to be unusable while this was queued.
+    this.#enqueue(async () => {
+      try {
+        if (!this.#cacheAvailable) {
+          return;
+        }
+        const bytes = await this.#frame(snapshot, schemas);
+        const meta = this.#buildMeta(snapshot, bytes.byteLength, {
+          trigger: "recovered",
+          triggerLabel: TRIGGER_LABELS.recovered,
+          sealed: false,
+        });
+        await this.#store.writeMirror(meta, bytes);
+        this.#mirroredMessageCount = mirroredCount;
+      } finally {
+        this.#mirrorInFlight = false;
+      }
+    });
+  }
+
+  // --- live ring -------------------------------------------------------------------
+
+  /**
+   * Insert keeping `#records` sorted ascending by `logTime`. Messages usually arrive in
+   * publish-time order (fast-path push at the tail), but a source that jumps time
+   * backward (a looping replay, say) can deliver out-of-order times. Staying sorted means
+   * `#records[0]` is always the min-`logTime` record and the last is the max, so span
+   * reporting and oldest-first eviction stay correct.
+   */
+  #insertRecord(record: DvrRecord): void {
+    const n = this.#records.length;
+    const last = this.#records[n - 1];
+    if (last == undefined || record.logTime >= last.logTime) {
+      this.#records.push(record);
+      return;
+    }
+    let lo = 0;
+    let hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const midRecord = this.#records[mid];
+      if (midRecord != undefined && midRecord.logTime <= record.logTime) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    this.#records.splice(lo, 0, record);
+  }
+
+  /**
+   * Enforce the configured budget after a push. With auto-save off this is a true ring
+   * (evict oldest). With auto-save on, exceeding the budget snapshots the whole window,
+   * clears it synchronously (the re-entrancy guard — the next message starts a fresh
+   * window, so a slow build can never double-flush), and kicks off an async build.
+   * Schemas persist across windows so every rotated file is self-contained.
+   */
+  #enforceBudget(): void {
+    const budgetNanos = this.#budgetNanos;
+    const budgetBytes = this.#budgetBytes;
+    if (this.#budgetMode === "time" && budgetNanos != undefined) {
+      while (this.#records.length > 1) {
+        const oldest = this.#records[0];
+        const newest = this.#records[this.#records.length - 1];
+        if (oldest == undefined || newest == undefined) {
+          break;
+        }
+        if (newest.logTime - oldest.logTime <= budgetNanos) {
+          break;
+        }
+        if (this.#rotateOrEvict()) {
+          break; // rotation cleared the buffer; nothing left to trim
+        }
+      }
+    } else if (this.#budgetMode === "bytes" && budgetBytes != undefined) {
+      while (this.#records.length > 0 && this.#byteTotal > budgetBytes) {
+        if (this.#rotateOrEvict()) {
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Evict the oldest record (ring) or rotate the whole window (auto-save). Returns true
+   * when a rotation cleared the buffer, so the caller stops looping.
+   */
+  #rotateOrEvict(): boolean {
+    if (this.#autoSave) {
+      const snapshot = this.#records.slice();
+      const snapshotSchemas = this.#snapshotSchemaMap();
+      this.#records.length = 0;
+      this.#byteTotal = 0;
+      this.#rotations++;
+      this.#mirroredMessageCount = -1;
+      this.#flushRotation(snapshot, snapshotSchemas);
+      this.#postStat();
+      return true;
+    }
+    // `#records` is sorted by logTime, so index 0 is the oldest record — shifting it
+    // always shrinks the buffered span (unlike shifting by arrival order, which can leave
+    // the min/max untouched and over-evict the window under out-of-order times).
+    const gone = this.#records.shift();
+    if (gone != undefined) {
+      this.#byteTotal -= gone.data.byteLength;
+    }
+    return false;
+  }
+
+  /** Async-frame a rotated window and post it as a rotation "saved" event. */
+  #flushRotation(snapshot: DvrRecord[], schemas: Map<string, DvrSchema>): void {
+    this.#frame(snapshot, schemas)
+      .then((bytes) => {
+        this.#emitBuffer(bytes, "rotation");
+      })
+      .catch((err: unknown) => {
+        this.#emitError(err);
+      });
+  }
+
+  /** Freeze the current per-topic schemas into the framing shape (name/encoding/data). */
+  #snapshotSchemaMap(): Map<string, DvrSchema> {
+    const schemas = new Map<string, DvrSchema>();
+    for (const [topic, entry] of this.#schemaByTopic) {
+      schemas.set(topic, {
+        name: entry.name,
+        encoding: "jsonschema",
+        data: this.#encoder.encode(JSON.stringify(entry.schema)),
+      });
+    }
+    return schemas;
+  }
+
+  #encodeMessage(message: unknown): Uint8Array {
+    try {
+      if (message == undefined) {
+        return this.#encoder.encode("null");
+      }
+      return this.#encoder.encode(JSON.stringify(message, jsonReplacer));
+    } catch (err) {
+      return this.#encoder.encode(JSON.stringify({ __dvr_encode_error: String(err) }));
+    }
+  }
+
+  // --- plumbing --------------------------------------------------------------------
+
+  #postStat(): void {
+    this.#emit(this.stats());
+  }
+
+  #emitBuffer(bytes: Uint8Array, kind: "manual" | "rotation"): void {
+    const buffer = toArrayBuffer(bytes);
+    this.#emit(
+      {
+        type: "saved",
+        buffer,
+        messageCount: this.#messageCount,
+        channels: this.#schemaByTopic.size,
+        rotation: kind === "rotation",
+      },
+      [buffer],
+    );
+  }
+
+  #emitError(err: unknown): void {
+    this.#emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
+  }
+
+  /**
+   * Queue a store operation. Serializing them means one writer at a time (no OPFS handle
+   * races, no overlapping MCAP builds) and a stable order. A rejection is reported and
+   * swallowed so the chain — and live capture — keep running.
+   */
+  #enqueue(operation: () => Promise<void>): void {
+    this.#queue = this.#queue.then(operation).catch((err: unknown) => {
+      this.#emitError(err);
+    });
+  }
+
+  /**
+   * Like {@link CaptureEngine.#enqueue}, but skipped when the durable cache turned out to
+   * be unusable. The caller's synchronous `#requireCache()` check can be stale: a request
+   * may be queued behind a `start()` whose `store.init()` is still pending.
+   */
+  #enqueueCacheOp(operation: () => Promise<void>): void {
+    this.#enqueue(async () => {
+      if (!this.#cacheAvailable) {
+        return;
+      }
+      await operation();
+    });
+  }
+}
+
+function toNanos(time?: Time): bigint {
+  if (time == undefined) {
+    return 0n;
+  }
+  return BigInt(time.sec) * 1_000_000_000n + BigInt(time.nsec);
+}
+
+/** Detach a view into its own transferable ArrayBuffer. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+function toBase64(view: ArrayBufferView): string {
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + chunkSize) as unknown as number[],
+    );
+  }
+  return btoa(binary);
+}
+
+function jsonReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  // Unsigned byte arrays -> base64 string (matches contentEncoding:base64 in the schema).
+  // Int8Array is intentionally NOT base64'd: the app's normalizeInt8Array
+  // (OccupancyGrid.data) rejects a Uint8Array, so it must stay a number array.
+  if (value instanceof Uint8Array) {
+    return toBase64(value);
+  }
+  // Other typed arrays (Int8Array, Float32Array, etc.) -> plain number arrays.
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    return Array.from(value as unknown as ArrayLike<number>);
+  }
+  return value;
+}
