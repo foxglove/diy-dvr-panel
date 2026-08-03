@@ -143,8 +143,9 @@ export class CaptureEngine {
   #lastMessageAt: number | undefined = undefined;
   #gapArmed = false;
 
-  // --- mirror throttle ---
-  #lastMirrorAt = 0;
+  // --- mirror throttle (seeded to construction time so the first mirror waits one
+  // interval instead of firing on the very first tick) ---
+  #lastMirrorAt: number;
   #mirrorInFlight = false;
   #mirroredMessageCount = -1;
 
@@ -157,6 +158,7 @@ export class CaptureEngine {
     this.#emit = deps.emit;
     this.#frame = deps.frame ?? buildMcap;
     this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
+    this.#lastMirrorAt = deps.now();
   }
 
   // --- lifecycle ------------------------------------------------------------------
@@ -375,7 +377,7 @@ export class CaptureEngine {
     };
   }
 
-  /** The live ring, oldest first. Read-only snapshot view. */
+  /** The live ring, oldest first. A read-only view of the engine's own array. */
   public bufferedRecords(): readonly DvrRecord[] {
     return this.#records;
   }
