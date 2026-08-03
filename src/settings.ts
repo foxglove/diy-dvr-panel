@@ -23,6 +23,10 @@ export type DvrConfig = {
   /** Seconds when mode === "time" (default 60); MB when mode === "bytes". */
   budgetValue: number;
   autoSave: boolean;
+  /** Total cap on the durable clip cache, in MB. Oldest whole clips are dropped first. */
+  maxCacheMb: number;
+  /** Seconds without any message that trigger a "gap" clip. 0 disables the trigger. */
+  gapThresholdSec: number;
 };
 
 export const DEFAULT_CONFIG: DvrConfig = {
@@ -30,6 +34,8 @@ export const DEFAULT_CONFIG: DvrConfig = {
   budgetMode: "time",
   budgetValue: 60,
   autoSave: false,
+  maxCacheMb: 512,
+  gapThresholdSec: 10,
 };
 
 /** Options describing the (session-only) silent-save destination for the editor. */
@@ -144,6 +150,29 @@ export function buildSettingsTree(
       "Silent save requires a Chromium-based build (Chrome/Edge desktop or web). Files will download instead.";
   }
 
+  // The durable clip cache: event-triggered snapshots are written to browser storage
+  // (OPFS) so they outlive a panel remount / worker teardown, bounded by a byte cap.
+  const cache: SettingsTreeNode = {
+    label: "Clip cache",
+    fields: {
+      maxCacheMb: {
+        label: "Cache limit (MB)",
+        input: "number",
+        value: config.maxCacheMb,
+        min: 0,
+      },
+      gapThresholdSec: {
+        label: "Gap trigger (seconds)",
+        input: "number",
+        value: config.gapThresholdSec,
+        min: 1,
+      },
+    },
+    help:
+      "Clips are captured on a connection gap, when the tab is hidden, and on close, and " +
+      "survive a reconnect. The oldest clips are dropped when the cache limit is exceeded.",
+  };
+
   const topicsNode: SettingsTreeNode = {
     label: "Topics",
     defaultExpansionState: "collapsed",
@@ -154,10 +183,27 @@ export function buildSettingsTree(
     nodes: {
       general,
       saving,
+      cache,
       topics: topicsNode,
     },
     actionHandler,
   };
+}
+
+/**
+ * Coerce a settings-editor number field, clamped at zero. Returns `undefined` when the
+ * value is unusable or unchanged, so the caller can keep the current config reference.
+ */
+function numericUpdate(value: unknown, current: number): number | undefined {
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) {
+    return undefined;
+  }
+  const next = Math.max(0, parsed);
+  if (next === current) {
+    return undefined;
+  }
+  return next;
 }
 
 /**
@@ -198,6 +244,24 @@ export function applyAction(config: DvrConfig, action: SettingsTreeAction): DvrC
         return config;
       }
       return { ...config, autoSave: next };
+    }
+    return config;
+  }
+
+  if (path[0] === "cache") {
+    if (path[1] === "maxCacheMb") {
+      const next = numericUpdate(value, config.maxCacheMb);
+      if (next == undefined) {
+        return config;
+      }
+      return { ...config, maxCacheMb: next };
+    }
+    if (path[1] === "gapThresholdSec") {
+      const next = numericUpdate(value, config.gapThresholdSec);
+      if (next == undefined) {
+        return config;
+      }
+      return { ...config, gapThresholdSec: next };
     }
     return config;
   }
