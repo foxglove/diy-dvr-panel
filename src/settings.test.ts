@@ -10,8 +10,8 @@ function update(path: string[], value: unknown): SettingsTreeAction {
 const noop = jest.fn();
 
 describe("DEFAULT_CONFIG", () => {
-  it("defaults the clip cache to 512 MB and a 10 s gap trigger", () => {
-    expect(DEFAULT_CONFIG.maxCacheMb).toBe(512);
+  it("defaults the clip cache to 2048 MB and a 10 s gap trigger", () => {
+    expect(DEFAULT_CONFIG.maxCacheMb).toBe(2048);
     expect(DEFAULT_CONFIG.gapThresholdSec).toBe(10);
   });
 });
@@ -92,7 +92,7 @@ describe("buildSettingsTree", () => {
     const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop);
     const cache = tree.nodes.cache;
     expect(cache?.label).toBe("Clip cache");
-    expect(cache?.fields?.maxCacheMb).toMatchObject({ input: "number", value: 512, min: 0 });
+    expect(cache?.fields?.maxCacheMb).toMatchObject({ input: "number", value: 2048, min: 0 });
     expect(cache?.fields?.gapThresholdSec).toMatchObject({ input: "number", value: 10, min: 1 });
   });
 

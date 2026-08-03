@@ -13,6 +13,11 @@ import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./set
 type ColorScheme = "light" | "dark";
 
 type Theme = {
+  /**
+   * Opaque panel background. Required by the sticky header: a translucent background
+   * would let scrolled content show through it.
+   */
+  bg: string;
   fg: string;
   muted: string;
   border: string;
@@ -22,11 +27,24 @@ type Theme = {
   accentHoverBg: string;
   accentFg: string;
   accentText: string;
+  /** Capture-active indicator, and the "plenty of room" end of the cache meter. */
+  success: string;
+  /** Cache meter approaching the cap. */
+  warn: string;
+  /** Destructive actions, and a full cache. */
+  danger: string;
+  dangerBorder: string;
+  dangerHoverBg: string;
 };
 
+// Contrast against the scheme's own `bg`, measured: every color below is at least
+// 4.5:1 (WCAG AA for normal text) in both light and dark.
+//   light  fg 15.78  muted 4.83  accentText 4.63  success 5.08  warn 4.87  danger 6.54
+//   dark   fg 13.69  muted 6.10  accentText 7.73  success 6.71  warn 6.75  danger 5.97
 function makeTheme(scheme: ColorScheme): Theme {
   if (scheme === "light") {
     return {
+      bg: "#ffffff",
       fg: "#1f2329",
       muted: "#6b7280",
       border: "rgba(0, 0, 0, 0.15)",
@@ -36,9 +54,15 @@ function makeTheme(scheme: ColorScheme): Theme {
       accentHoverBg: "#1a5fd0",
       accentFg: "#ffffff",
       accentText: "#1f6feb",
+      success: "#1a7f37",
+      warn: "#9a6700",
+      danger: "#b3261e",
+      dangerBorder: "rgba(179, 38, 30, 0.5)",
+      dangerHoverBg: "rgba(179, 38, 30, 0.08)",
     };
   }
   return {
+    bg: "#1a1c21",
     fg: "#e6e6ea",
     muted: "#9a9aa2",
     border: "rgba(255, 255, 255, 0.16)",
@@ -48,13 +72,21 @@ function makeTheme(scheme: ColorScheme): Theme {
     accentHoverBg: "#3d78e8",
     accentFg: "#ffffff",
     accentText: "#7db0ff",
+    success: "#3fb950",
+    warn: "#d29922",
+    danger: "#f47067",
+    dangerBorder: "rgba(244, 112, 103, 0.5)",
+    dangerHoverBg: "rgba(244, 112, 103, 0.12)",
   };
 }
 
 /** Which destructive action is waiting on an inline "are you sure?" confirmation. */
-type ConfirmTarget = { kind: "clip"; id: string } | { kind: "all" };
+type ConfirmTarget = { kind: "clip"; id: string } | { kind: "all" } | { kind: "reset" };
 
-type ButtonVariant = "primary" | "default" | "link";
+/** The buffer controls fill the panel, but stop before they look stretched. */
+const CONTROL_ROW_MAX_WIDTH = 400;
+
+type ButtonVariant = "primary" | "default" | "danger" | "link";
 
 type ButtonState = { disabled: boolean; hover: boolean };
 
@@ -80,6 +112,11 @@ function buttonStyle(
     fontWeight: 500,
     lineHeight: 1.2,
     borderRadius: 0,
+    // Buttons carry an inline icon plus a label; keep them on one baseline.
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "0.35rem",
     // Panels can be narrow; let a button row wrap rather than breaking a label
     // across lines ("Save / to / disk").
     whiteSpace: "nowrap",
@@ -106,6 +143,17 @@ function buttonStyle(
       border: "1px solid transparent",
     };
   }
+  if (variant === "danger") {
+    // Understated on purpose: a red outline reads as destructive without shouting
+    // like a solid fill would, which matches the restrained look of the app.
+    return {
+      ...base,
+      padding: "0.45rem 0.9rem",
+      color: theme.danger,
+      background: pickBg(state, "transparent", theme.dangerHoverBg),
+      border: `1px solid ${theme.dangerBorder}`,
+    };
+  }
   return {
     ...base,
     padding: "0.45rem 0.9rem",
@@ -119,12 +167,18 @@ function ThemedButton({
   theme,
   variant = "default",
   disabled = false,
+  title,
+  style,
   onClick,
   children,
 }: {
   theme: Theme;
   variant?: ButtonVariant;
   disabled?: boolean;
+  /** Tooltip / accessible name, for the controls whose label is just a glyph. */
+  title?: string;
+  /** Merged over the variant style, for per-call layout tweaks (flex sizing, hit area). */
+  style?: React.CSSProperties;
   onClick: () => void;
   children: React.ReactNode;
 }): React.JSX.Element {
@@ -133,7 +187,9 @@ function ThemedButton({
     <button
       onClick={onClick}
       disabled={disabled}
-      style={buttonStyle(theme, variant, { disabled, hover })}
+      title={title}
+      aria-label={title}
+      style={{ ...buttonStyle(theme, variant, { disabled, hover }), ...style }}
       onMouseEnter={() => {
         setHover(true);
       }}
@@ -143,6 +199,54 @@ function ThemedButton({
     >
       {children}
     </button>
+  );
+}
+
+// Inline SVGs rather than an icon dependency: they inherit `currentColor` and the
+// button's font size, so they stay correct in both color schemes automatically.
+const ICON_PROPS = {
+  width: "1em",
+  height: "1em",
+  viewBox: "0 0 16 16",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.5,
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+  "aria-hidden": true,
+  focusable: false,
+  style: { flex: "0 0 auto" },
+} as const;
+
+/** Download / save-to-disk. */
+function SaveIcon(): React.JSX.Element {
+  return (
+    <svg {...ICON_PROPS}>
+      <path d="M8 2v7.5" />
+      <path d="M5 7l3 3 3-3" />
+      <path d="M2.5 11.5v1a1.5 1.5 0 0 0 1.5 1.5h8a1.5 1.5 0 0 0 1.5-1.5v-1" />
+    </svg>
+  );
+}
+
+/** Snapshot / bookmark, for stashing a clip in the cache. */
+function ClipIcon(): React.JSX.Element {
+  return (
+    <svg {...ICON_PROPS}>
+      <path d="M4 2h8a.5.5 0 0 1 .5.5v11l-4.5-3-4.5 3v-11A.5.5 0 0 1 4 2Z" />
+    </svg>
+  );
+}
+
+/** Trash, for discarding the live buffer. */
+function TrashIcon(): React.JSX.Element {
+  return (
+    <svg {...ICON_PROPS}>
+      <path d="M2.5 4.5h11" />
+      <path d="M6.5 2.5h3" />
+      <path d="M4 4.5l.6 8.2a1 1 0 0 0 1 .8h4.8a1 1 0 0 0 1-.8l.6-8.2" />
+      <path d="M6.5 7v4M9.5 7v4" />
+    </svg>
   );
 }
 
@@ -392,6 +496,92 @@ function cacheModeLabel(cache: CacheStatus): string {
   }
 }
 
+/**
+ * Cache fullness, green through amber to red. Eviction silently drops the oldest whole
+ * clip at the cap, so "getting full" is worth showing before it bites.
+ */
+function meterColor(theme: Theme, ratio: number): string {
+  if (ratio >= 0.9) {
+    return theme.danger;
+  }
+  if (ratio >= 0.7) {
+    return theme.warn;
+  }
+  return theme.success;
+}
+
+function CacheMeter({
+  theme,
+  usedBytes,
+  capBytes,
+}: {
+  theme: Theme;
+  usedBytes: number;
+  capBytes: number;
+}): React.JSX.Element | null {
+  if (capBytes <= 0) {
+    return null;
+  }
+  const ratio = Math.min(1, Math.max(0, usedBytes / capBytes));
+  return (
+    <div
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(ratio * 100)}
+      aria-label="Clip cache used"
+      style={{
+        height: "0.25rem",
+        margin: "0 0 0.5rem",
+        background: theme.border,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          width: `${(ratio * 100).toFixed(1)}%`,
+          height: "100%",
+          background: meterColor(theme, ratio),
+          transition: "width 0.3s ease, background 0.3s ease",
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * A `recovered` clip came from an interrupted session, so it is often longer and less
+ * expected than a clean gap clip — worth telling apart at a glance.
+ */
+function chipColors(theme: Theme, trigger: ClipMeta["trigger"]): React.CSSProperties {
+  if (trigger === "recovered") {
+    return { color: theme.warn, borderColor: theme.warn };
+  }
+  if (trigger === "manual-clip") {
+    return { color: theme.accentText, borderColor: theme.accentText };
+  }
+  return { color: theme.muted, borderColor: theme.border };
+}
+
+function TriggerChip({ theme, clip }: { theme: Theme; clip: ClipMeta }): React.JSX.Element {
+  return (
+    <span
+      style={{
+        ...chipColors(theme, clip.trigger),
+        borderStyle: "solid",
+        borderWidth: 1,
+        padding: "0.05rem 0.3rem",
+        fontSize: "0.6875rem",
+        fontWeight: 600,
+        letterSpacing: "0.02em",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {clip.triggerLabel}
+    </span>
+  );
+}
+
 function sectionTitleStyle(theme: Theme): React.CSSProperties {
   return {
     display: "flex",
@@ -439,10 +629,15 @@ function ClipRow({
   return (
     <div style={{ borderTop: `1px solid ${theme.border}`, padding: "0.35rem 0" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-        <ThemedButton theme={theme} variant="link" onClick={onToggleExpand}>
+        <ThemedButton
+          theme={theme}
+          variant="link"
+          title={expanded ? "Hide topics" : "Show topics"}
+          onClick={onToggleExpand}
+        >
           {expanded ? "▾" : "▸"}
         </ThemedButton>
-        <span style={{ fontWeight: 600, wordBreak: "break-word" }}>{clip.triggerLabel}</span>
+        <TriggerChip theme={theme} clip={clip} />
         <span style={{ flex: "1 1 auto" }} />
         {confirmingDelete ? (
           <>
@@ -456,10 +651,23 @@ function ClipRow({
           </>
         ) : (
           <>
-            <ThemedButton theme={theme} variant="link" onClick={onSave}>
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              disabled={clip.messageCount === 0}
+              onClick={onSave}
+            >
               Save to disk
             </ThemedButton>
-            <ThemedButton theme={theme} variant="link" onClick={onAskDelete}>
+            {/* Bigger hit area and a clear gap from Save, so the destructive
+                control is harder to catch by accident. */}
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              title="Delete clip"
+              style={{ padding: "0.25rem 0.4rem", marginLeft: "0.5rem" }}
+              onClick={onAskDelete}
+            >
               ✕
             </ThemedButton>
           </>
@@ -536,6 +744,9 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [cache, setCache] = useState<CacheStatus>(UNKNOWN_CACHE);
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [confirming, setConfirming] = useState<ConfirmTarget | undefined>(undefined);
+  // Collapsed by default: the pinned status line already carries the state that matters,
+  // and a panel sharing a layout with others is usually short.
+  const [showDetails, setShowDetails] = useState(false);
 
   const workerRef = useRef<Worker | undefined>(undefined);
   const dirHandleRef = useRef<FileSystemDirectoryHandle | undefined>(undefined);
@@ -865,6 +1076,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     setForwarded(0);
     setStat(ZERO_STAT);
     setLastSaveStatus("");
+    setConfirming(undefined);
   }, []);
 
   /** Snapshot the current buffer into a durable clip on demand. */
@@ -933,6 +1145,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const clipsNewestFirst = [...clips].reverse();
   const hasClips = clips.length > 0;
 
+  const hasBuffer = stat.bufferedMsgs > 0;
+  const capBytes = Math.round(config.maxCacheMb * 1024 * 1024);
+  const fillStyle: React.CSSProperties = { flex: `1 1 120px` };
+
   const statRows: Array<{ label: string; value: React.ReactNode }> = [
     { label: "Worker", value: workerReady ? "Ready" : "Starting…" },
     { label: "Capture", value: captureOn ? "On" : "Off" },
@@ -948,104 +1164,232 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   return (
     <div
       style={{
-        padding: "1rem",
+        height: "100%",
+        overflowY: "auto",
+        padding: "0.75rem",
+        boxSizing: "border-box",
         fontFamily: "inherit",
         fontSize: "0.8125rem",
         lineHeight: 1.5,
         color: theme.fg,
+        // Opaque so the sticky zone below has something solid to sit on.
+        background: theme.bg,
       }}
     >
-      <p style={{ margin: "0 0 0.85rem", color: theme.muted, fontSize: "0.75rem" }}>
-        Topics, lookback, auto-save, and the clip cache are in panel Settings (gear icon).
-      </p>
-
+      {/* Pinned: the buffer controls and one line of state. This panel shares a layout
+          with others and is often short, so these must stay reachable without scrolling.
+          Deliberately just the buttons plus one line — the stat grid is not pinned. */}
       <div
         style={{
-          display: "flex",
-          flexWrap: "wrap",
-          alignItems: "center",
-          gap: "0.5rem",
-          marginBottom: "0.85rem",
+          position: "sticky",
+          top: 0,
+          zIndex: 1,
+          background: theme.bg,
+          // Bleed over the container padding so scrolled content cannot appear beside it.
+          margin: "0 -0.75rem",
+          padding: "0 0.75rem 0.5rem",
         }}
       >
-        <ThemedButton
-          theme={theme}
-          variant="default"
-          disabled={!workerReady || !hasClips}
-          onClick={onSaveAll}
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.5rem",
+            maxWidth: CONTROL_ROW_MAX_WIDTH,
+          }}
         >
-          Save all
-        </ThemedButton>
-        {confirming?.kind === "all" ? (
-          <>
-            <span style={{ color: theme.muted }}>Clear {clips.length} cached clips?</span>
-            <ThemedButton theme={theme} variant="link" onClick={onClearClips}>
-              Yes
-            </ThemedButton>
-            <ThemedButton
-              theme={theme}
-              variant="link"
-              onClick={() => {
-                setConfirming(undefined);
-              }}
-            >
-              No
-            </ThemedButton>
-          </>
-        ) : (
+          <ThemedButton
+            theme={theme}
+            variant="primary"
+            style={fillStyle}
+            disabled={!workerReady || !hasBuffer}
+            title={hasBuffer ? "Write the current buffer to an MCAP file" : "Nothing buffered yet"}
+            onClick={onSave}
+          >
+            <SaveIcon />
+            Save to disk
+          </ThemedButton>
           <ThemedButton
             theme={theme}
             variant="default"
-            disabled={!workerReady || !hasClips}
-            onClick={() => {
-              setConfirming({ kind: "all" });
-            }}
+            style={fillStyle}
+            disabled={!workerReady || !hasBuffer}
+            title="Snapshot the buffer into the clip cache"
+            onClick={onCacheClip}
           >
-            Clear all
+            <ClipIcon />
+            Cache clip
           </ThemedButton>
-        )}
+          {confirming?.kind === "reset" ? (
+            <div
+              style={{
+                ...fillStyle,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "0.35rem",
+                color: theme.muted,
+              }}
+            >
+              <span>Discard?</span>
+              <ThemedButton theme={theme} variant="link" onClick={onReset}>
+                Yes
+              </ThemedButton>
+              <ThemedButton
+                theme={theme}
+                variant="link"
+                onClick={() => {
+                  setConfirming(undefined);
+                }}
+              >
+                No
+              </ThemedButton>
+            </div>
+          ) : (
+            <ThemedButton
+              theme={theme}
+              variant="danger"
+              style={fillStyle}
+              disabled={!workerReady}
+              title="Discard everything in the live buffer"
+              onClick={() => {
+                setConfirming({ kind: "reset" });
+              }}
+            >
+              <TrashIcon />
+              Reset buffer
+            </ThemedButton>
+          )}
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "baseline",
+            gap: "0.4rem",
+            marginTop: "0.5rem",
+            color: captureOn ? theme.fg : theme.muted,
+          }}
+        >
+          <span aria-hidden style={{ color: captureOn ? theme.success : theme.muted }}>
+            ●
+          </span>
+          <span>
+            {captureOn ? "Recording" : workerReady ? "Idle" : "Starting…"} — {budget.used} /{" "}
+            {budget.cap}
+          </span>
+        </div>
       </div>
 
-      <div style={sectionTitleStyle(theme)}>Current buffer</div>
-
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.6rem" }}>
-        <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onSave}>
-          Save to disk
-        </ThemedButton>
+      <div style={sectionTitleStyle(theme)}>
         <ThemedButton
           theme={theme}
-          variant="default"
-          disabled={!workerReady || stat.bufferedMsgs === 0}
-          onClick={onCacheClip}
+          variant="link"
+          title={showDetails ? "Hide details" : "Show details"}
+          onClick={() => {
+            setShowDetails((previous) => !previous);
+          }}
         >
-          Cache clip
-        </ThemedButton>
-        <ThemedButton theme={theme} variant="default" disabled={!workerReady} onClick={onReset}>
-          Reset buffer
+          {showDetails ? "▾" : "▸"} Current buffer
         </ThemedButton>
       </div>
 
-      <div style={{ display: "grid", rowGap: "0.15rem", marginBottom: "1rem" }}>
-        {statRows.map((row) => (
-          <div
-            key={row.label}
-            style={{ display: "flex", justifyContent: "space-between", gap: "1rem" }}
-          >
-            <span style={{ color: theme.muted }}>{row.label}</span>
-            <span style={{ color: theme.fg, textAlign: "right", wordBreak: "break-word" }}>
-              {row.value}
-            </span>
-          </div>
-        ))}
-      </div>
+      {showDetails && (
+        <div style={{ display: "grid", rowGap: "0.15rem", marginBottom: "1rem" }}>
+          {statRows.map((row) => (
+            <div
+              key={row.label}
+              style={{ display: "flex", justifyContent: "space-between", gap: "1rem" }}
+            >
+              <span style={{ color: theme.muted }}>{row.label}</span>
+              <span style={{ color: theme.fg, textAlign: "right", wordBreak: "break-word" }}>
+                {row.value}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Save feedback matters even with the details collapsed, so surface it either way. */}
+      {!showDetails && lastSaveStatus.length > 0 && (
+        <p
+          style={{
+            margin: "0 0 1rem",
+            color: theme.muted,
+            fontSize: "0.75rem",
+            wordBreak: "break-word",
+          }}
+        >
+          {lastSaveStatus}
+        </p>
+      )}
 
       <div style={sectionTitleStyle(theme)}>
         <span>Cached clips ({clips.length})</span>
         <span style={{ flex: "1 1 auto" }} />
-        <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: "normal" }}>
-          {formatBytes(cacheBytes)} / {config.maxCacheMb} MB · {cacheModeLabel(cache)}
-        </span>
+        {/* These act on the cache, so they live with it rather than at the top of the
+            panel. Nothing to act on at zero clips, so they are not rendered at all. */}
+        {hasClips &&
+          (confirming?.kind === "all" ? (
+            <span
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "0.3rem",
+                fontWeight: 400,
+                textTransform: "none",
+                letterSpacing: "normal",
+              }}
+            >
+              Clear {clips.length}?
+              <ThemedButton theme={theme} variant="link" onClick={onClearClips}>
+                Yes
+              </ThemedButton>
+              <ThemedButton
+                theme={theme}
+                variant="link"
+                onClick={() => {
+                  setConfirming(undefined);
+                }}
+              >
+                No
+              </ThemedButton>
+            </span>
+          ) : (
+            <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <ThemedButton
+                theme={theme}
+                variant="link"
+                disabled={!workerReady}
+                onClick={onSaveAll}
+              >
+                Save all
+              </ThemedButton>
+              <ThemedButton
+                theme={theme}
+                variant="link"
+                disabled={!workerReady}
+                onClick={() => {
+                  setConfirming({ kind: "all" });
+                }}
+              >
+                Clear all
+              </ThemedButton>
+            </span>
+          ))}
       </div>
+
+      <CacheMeter theme={theme} usedBytes={cacheBytes} capBytes={capBytes} />
+
+      <p
+        style={{
+          margin: "0 0 0.35rem",
+          color: theme.muted,
+          fontSize: "0.75rem",
+        }}
+      >
+        {formatBytes(cacheBytes)} / {config.maxCacheMb} MB · {cacheModeLabel(cache)}
+      </p>
 
       {hasClips ? (
         <div>

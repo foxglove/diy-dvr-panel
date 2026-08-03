@@ -23,7 +23,10 @@ export type DvrConfig = {
   /** Seconds when mode === "time" (default 60); MB when mode === "bytes". */
   budgetValue: number;
   autoSave: boolean;
-  /** Total cap on the durable clip cache, in MB. Oldest whole clips are dropped first. */
+  /**
+   * Total cap on the durable clip cache, in MB. Oldest whole clips are dropped first.
+   * Defaults high (2 GB) because a single clip off a busy stream can be hundreds of MB.
+   */
   maxCacheMb: number;
   /** Seconds without any message that trigger a "gap" clip. 0 disables the trigger. */
   gapThresholdSec: number;
@@ -34,7 +37,7 @@ export const DEFAULT_CONFIG: DvrConfig = {
   budgetMode: "time",
   budgetValue: 60,
   autoSave: false,
-  maxCacheMb: 512,
+  maxCacheMb: 2048,
   gapThresholdSec: 10,
 };
 
@@ -170,7 +173,10 @@ export function buildSettingsTree(
     },
     help:
       "Clips are captured on a connection gap, when the tab is hidden, and on close, and " +
-      "survive a reconnect. The oldest clips are dropped when the cache limit is exceeded.",
+      "survive a reconnect. The oldest clips are dropped when the cache limit is exceeded. " +
+      "Clips are held in browser storage, so the default 2 GB counts against this origin's " +
+      "storage quota — lower it if you are short on disk, or if the browser starts evicting " +
+      "storage on its own.",
   };
 
   const topicsNode: SettingsTreeNode = {
