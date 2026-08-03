@@ -20,6 +20,8 @@
     "foxglove:prepublish": "node scripts/bundle-worker.mjs && foxglove-extension build --mode production",
     "validate:mcap": "node scripts/validate-mcap.mjs",
     "typecheck": "node scripts/bundle-worker.mjs && tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
     "lint": "eslint .",
     "lint:ci": "eslint .",
     "lint:fix": "eslint --fix .",
@@ -30,14 +32,17 @@
   "devDependencies": {
     "@foxglove/eslint-plugin": "2.1.0",
     "@foxglove/extension": "^2.53.1",
+    "@types/jest": "^29.5.14",
     "@types/react": "18.2.17",
     "@types/react-dom": "18.2.7",
     "create-foxglove-extension": "^1.3.2",
     "eslint": "9.37.0",
     "eslint-plugin-react": "7.37.5",
+    "jest": "^29.7.0",
     "prettier": "3.6.2",
     "react": "18.2.0",
     "react-dom": "18.2.0",
+    "ts-jest": "^29.4.12",
     "typescript": "5.1.6"
   },
   "dependencies": {

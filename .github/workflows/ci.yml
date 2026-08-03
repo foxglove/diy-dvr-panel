@@ -24,6 +24,10 @@ jobs:
 
       - run: pnpm run typecheck
 
+      # Unit tests for the pure modules (captureEngine, settings). Node
+      # environment — no DOM and no Foxglove app needed.
+      - run: pnpm test
+
       # Packaging is the artifact the extension registry consumes, so a broken
       # package is a broken release. Build it on every PR rather than finding
       # out at tag time.
