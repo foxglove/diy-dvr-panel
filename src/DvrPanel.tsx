@@ -123,6 +123,39 @@ function mbToBytes(mb: number): number {
   return Math.round(mb * 1024 * 1024);
 }
 
+/** Controls that stay disabled while the worker is busy on their behalf. */
+const BUSY_CACHE_CLIP = "cache-clip";
+const BUSY_SAVE_ALL = "save-all";
+function busySaveClip(id: string): string {
+  return `save-clip:${id}`;
+}
+
+/**
+ * Longest a control stays disabled without hearing back. Framing and writing a ~1 GB window
+ * legitimately takes many seconds, so this is generous — it exists only so a stalled write or
+ * a lost reply cannot disable a button for the rest of the session.
+ */
+const BUSY_TIMEOUT_MS = 60_000;
+
+/**
+ * Run `work` once the browser has painted.
+ *
+ * The heavy framing happens in the worker, so the main thread is free — but the click handler
+ * still has to let React commit and paint the disabled state before posting, otherwise the
+ * message goes out in the same task and the user sees an unchanged, enabled button while
+ * several seconds of work happen. A `requestAnimationFrame` callback runs *before* the repaint,
+ * so the nested timeout is what lands after it.
+ */
+function afterPaint(work: () => void): void {
+  if (typeof requestAnimationFrame !== "function") {
+    setTimeout(work, 0);
+    return;
+  }
+  requestAnimationFrame(() => {
+    setTimeout(work, 0);
+  });
+}
+
 /** The buffer controls fill the panel, but stop before they look stretched. */
 const CONTROL_ROW_MAX_WIDTH = 400;
 
@@ -671,6 +704,8 @@ type ClipRowProps = {
   clip: ClipMeta;
   expanded: boolean;
   confirmingDelete: boolean;
+  /** This clip's bytes are being read back and written; reading ~1 GB is not instant. */
+  saving: boolean;
   onToggleExpand: () => void;
   onSave: () => void;
   onAskDelete: () => void;
@@ -684,6 +719,7 @@ function ClipRow({
   clip,
   expanded,
   confirmingDelete,
+  saving,
   onToggleExpand,
   onSave,
   onAskDelete,
@@ -721,10 +757,10 @@ function ClipRow({
             <ThemedButton
               theme={theme}
               variant="link"
-              disabled={clip.messageCount === 0}
+              disabled={clip.messageCount === 0 || saving}
               onClick={onSave}
             >
-              Save to disk
+              {saving ? "Saving…" : "Save to disk"}
             </ThemedButton>
             {/* Bigger hit area and a clear gap from Save, so the destructive
                 control is harder to catch by accident. */}
@@ -844,6 +880,9 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [cache, setCache] = useState<CacheStatus>(UNKNOWN_CACHE);
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [confirming, setConfirming] = useState<ConfirmTarget | undefined>(undefined);
+  // Controls waiting on the worker. Keyed rather than a single flag so a clip row can show
+  // its own progress without disabling the others.
+  const [busy, setBusy] = useState<ReadonlySet<string>>(() => new Set());
   // The numeric settings currently in force (see SETTLE_DELAY_MS).
   const [settled, setSettled] = useState<SettledNumbers>(() =>
     numbersOf({
@@ -871,6 +910,72 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   clipsRef.current = clips;
   const settledRef = useRef(settled);
   settledRef.current = settled;
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  /** Safety timers per busy key (see BUSY_TIMEOUT_MS). */
+  const busyTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** Clip ids known when "Cache clip" was dispatched, so its reply can be recognised. */
+  const clipsBeforeCacheRef = useRef<ReadonlySet<string> | undefined>(undefined);
+  /** Outstanding per-clip saves left in a "Save all" run. */
+  const saveAllRemainingRef = useRef(0);
+
+  const endBusy = useCallback((key: string) => {
+    const timer = busyTimersRef.current.get(key);
+    if (timer != undefined) {
+      clearTimeout(timer);
+      busyTimersRef.current.delete(key);
+    }
+    setBusy((previous) => {
+      if (!previous.has(key)) {
+        return previous; // same reference, no re-render
+      }
+      const next = new Set(previous);
+      next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const beginBusy = useCallback(
+    (key: string) => {
+      const existing = busyTimersRef.current.get(key);
+      if (existing != undefined) {
+        clearTimeout(existing);
+      }
+      busyTimersRef.current.set(
+        key,
+        setTimeout(() => {
+          endBusy(key);
+        }, BUSY_TIMEOUT_MS),
+      );
+      setBusy((previous) => new Set(previous).add(key));
+    },
+    [endBusy],
+  );
+
+  const clearAllBusy = useCallback(() => {
+    for (const timer of busyTimersRef.current.values()) {
+      clearTimeout(timer);
+    }
+    busyTimersRef.current.clear();
+    saveAllRemainingRef.current = 0;
+    clipsBeforeCacheRef.current = undefined;
+    setBusy((previous) => (previous.size === 0 ? previous : new Set()));
+  }, []);
+
+  // Reached from the worker's message handler, which is installed once and must not depend on
+  // anything that changes (re-running that effect would restart the worker).
+  const busyControlRef = useRef({ end: endBusy, clearAll: clearAllBusy });
+  busyControlRef.current = { end: endBusy, clearAll: clearAllBusy };
+
+  useEffect(() => {
+    const timers = busyTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        clearTimeout(timer);
+      }
+      timers.clear();
+    };
+  }, []);
 
   const enabledTopics = useMemo(
     () => topics.filter((topic) => !config.disabledTopics.includes(topic.name)),
@@ -913,10 +1018,17 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           });
           break;
         }
-        case "clips":
+        case "clips": {
           setClips(data.clips);
           setCache(data.cache ?? UNKNOWN_CACHE);
+          // A clip we had not seen before means the "Cache clip" write landed.
+          const before = clipsBeforeCacheRef.current;
+          if (before != undefined && data.clips.some((clip) => !before.has(clip.id))) {
+            clipsBeforeCacheRef.current = undefined;
+            busyControlRef.current.end(BUSY_CACHE_CLIP);
+          }
           break;
+        }
         case "clipBytes": {
           // Queue behind any in-flight clip write so "Save all" writes one file at a time.
           const { buffer, meta } = data;
@@ -933,12 +1045,24 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             .catch((err: unknown) => {
               console.error("[diy-dvr] failed to save clip", err);
               setLastSave({ text: `Clip save failed: ${String(err)}`, severity: "error" });
+            })
+            .finally(() => {
+              // This clip is done either way; release its row, and "Save all" once the last
+              // clip of the run has been written.
+              busyControlRef.current.end(busySaveClip(meta.id));
+              saveAllRemainingRef.current = Math.max(0, saveAllRemainingRef.current - 1);
+              if (saveAllRemainingRef.current === 0) {
+                busyControlRef.current.end(BUSY_SAVE_ALL);
+              }
             });
           break;
         }
         case "error":
           console.error("[diy-dvr] worker save failed", data.message);
           setLastSave({ text: data.message, severity: "error" });
+          // The message does not say which request failed, so release everything rather than
+          // risk leaving a control disabled. Re-enabling early is recoverable; stuck is not.
+          busyControlRef.current.clearAll();
           break;
       }
     };
@@ -1224,34 +1348,64 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     setConfirming(undefined);
   }, []);
 
-  /** Snapshot the current buffer into a durable clip on demand. */
+  /**
+   * Snapshot the current buffer into a durable clip on demand.
+   *
+   * Framing a large window and writing it takes seconds, all of it in the worker, so the only
+   * thing the user sees is this button. Disable it and relabel it *before* dispatching, or the
+   * click looks like it did nothing and gets repeated.
+   */
   const onCacheClip = useCallback(() => {
-    workerRef.current?.postMessage({ type: "trigger", tag: "manual-clip" });
-  }, []);
+    if (busyRef.current.has(BUSY_CACHE_CLIP)) {
+      return;
+    }
+    clipsBeforeCacheRef.current = new Set((clipsRef.current ?? []).map((clip) => clip.id));
+    beginBusy(BUSY_CACHE_CLIP);
+    afterPaint(() => {
+      workerRef.current?.postMessage({ type: "trigger", tag: "manual-clip" });
+    });
+  }, [beginBusy]);
 
   const onSaveClip = useCallback(
     (id: string) => {
+      const key = busySaveClip(id);
+      if (busyRef.current.has(key)) {
+        return;
+      }
+      beginBusy(key);
       void (async () => {
+        // Still inside the click for the permission request; only the dispatch is deferred.
         await prewarmSaveGrant();
-        workerRef.current?.postMessage({ type: "requestClipBytes", id });
+        afterPaint(() => {
+          workerRef.current?.postMessage({ type: "requestClipBytes", id });
+        });
       })();
     },
-    [prewarmSaveGrant],
+    [beginBusy, prewarmSaveGrant],
   );
 
   /** Request every cached clip, oldest first, and write them in that order. */
   const onSaveAll = useCallback(() => {
+    const queued = clipsRef.current ?? [];
+    if (queued.length === 0 || busyRef.current.has(BUSY_SAVE_ALL)) {
+      return;
+    }
+    saveAllRemainingRef.current = queued.length;
+    beginBusy(BUSY_SAVE_ALL);
     void (async () => {
       await prewarmSaveGrant();
-      const worker = workerRef.current;
-      if (worker == undefined) {
-        return;
-      }
-      for (const clip of clipsRef.current ?? []) {
-        worker.postMessage({ type: "requestClipBytes", id: clip.id });
-      }
+      afterPaint(() => {
+        const worker = workerRef.current;
+        if (worker == undefined) {
+          endBusy(BUSY_SAVE_ALL);
+          return;
+        }
+        for (const clip of queued) {
+          worker.postMessage({ type: "requestClipBytes", id: clip.id });
+        }
+      });
     })();
-  }, [prewarmSaveGrant]);
+  }, [beginBusy, endBusy, prewarmSaveGrant]);
 
   const onDeleteClip = useCallback((id: string) => {
     workerRef.current?.postMessage({ type: "deleteClip", id });
@@ -1293,6 +1447,8 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const hasClips = loadedClips.length > 0;
 
   const hasBuffer = stat.bufferedMsgs > 0;
+  const cachingClip = busy.has(BUSY_CACHE_CLIP);
+  const savingAll = busy.has(BUSY_SAVE_ALL);
   const status = bufferStatus(stat, { workerReady, enabledTopics: enabledTopics.length });
   const alert =
     lastSave != undefined && lastSave.severity !== "ok"
@@ -1369,12 +1525,16 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             theme={theme}
             variant="default"
             style={fillStyle}
-            disabled={!workerReady || !hasBuffer}
-            title="Snapshot the buffer into the clip cache"
+            disabled={!workerReady || !hasBuffer || cachingClip}
+            title={
+              cachingClip
+                ? "Framing and writing the clip…"
+                : "Snapshot the buffer into the clip cache"
+            }
             onClick={onCacheClip}
           >
             <ClipIcon />
-            Cache clip
+            {cachingClip ? "Caching…" : "Cache clip"}
           </ThemedButton>
           {confirming?.kind === "reset" ? (
             <div
@@ -1565,10 +1725,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
               <ThemedButton
                 theme={theme}
                 variant="link"
-                disabled={!workerReady}
+                disabled={!workerReady || savingAll}
                 onClick={onSaveAll}
               >
-                Save all
+                {savingAll ? "Saving…" : "Save all"}
               </ThemedButton>
               <ThemedButton
                 theme={theme}
@@ -1605,6 +1765,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
               clip={clip}
               expanded={expandedIds.has(clip.id)}
               confirmingDelete={confirming?.kind === "clip" && confirming.id === clip.id}
+              saving={busy.has(busySaveClip(clip.id))}
               onToggleExpand={() => {
                 onToggleExpand(clip.id);
               }}
