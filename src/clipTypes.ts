@@ -1,5 +1,10 @@
-// Shared clip vocabulary: imported by the capture engine, the worker adapter, the
-// OPFS store, and the panel. Types only — nothing here has a runtime footprint.
+// Shared clip vocabulary: imported by the capture engine, the worker adapter, the OPFS
+// store, and the panel.
+//
+// Mostly types. The one piece of logic here is the eviction plan, which both sides need and
+// must agree on: the worker executes it, and the panel previews it to say how many clips a
+// lower cache limit would drop. It lives here rather than in `captureEngine.ts` so the panel
+// can use it without pulling the MCAP writer into its bundle.
 
 /**
  * Why a clip was captured.
@@ -58,3 +63,42 @@ export type ClipMeta = {
   /** False only for the live mirror, which is still being updated. */
   sealed: boolean;
 };
+
+/**
+ * Eviction order: `recovered` clips first, then oldest first.
+ *
+ * A recovered clip is churn produced by reconnecting, not something the user asked for, so it
+ * goes ahead of any `gap`, `manual`, or auto-save window however new it is.
+ */
+function compareEvictionOrder(a: ClipMeta, b: ClipMeta): number {
+  const aRank = a.trigger === "recovered" ? 0 : 1;
+  const bRank = b.trigger === "recovered" ? 0 : 1;
+  if (aRank !== bRank) {
+    return aRank - bRank;
+  }
+  return a.createdAt - b.createdAt;
+}
+
+/**
+ * Which clips have to go for the cache to fit `capBytes`, in the order they would be dropped.
+ *
+ * At least one clip is always kept, so a single clip larger than the cap survives rather than
+ * being written and immediately deleted.
+ *
+ * The worker runs this to evict; the panel runs it to tell the user what lowering the limit
+ * would cost before it happens.
+ */
+export function planEviction(clips: readonly ClipMeta[], capBytes: number): ClipMeta[] {
+  let total = clips.reduce((sum, clip) => sum + clip.byteSize, 0);
+  let remaining = clips.length;
+  const doomed: ClipMeta[] = [];
+  for (const clip of [...clips].sort(compareEvictionOrder)) {
+    if (total <= capBytes || remaining <= 1) {
+      break;
+    }
+    doomed.push(clip);
+    total -= clip.byteSize;
+    remaining--;
+  }
+  return doomed;
+}

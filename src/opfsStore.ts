@@ -102,7 +102,6 @@ export type ClipStore = {
   readClip: (id: string) => Promise<Uint8Array | undefined>;
   deleteClip: (id: string) => Promise<void>;
   clearClips: () => Promise<void>;
-  totalClipBytes: () => Promise<number>;
   /** Overwrite this instance's mirror of the live ring buffer. */
   writeMirror: (meta: ClipMeta, bytes: Uint8Array) => Promise<void>;
   /** Mirrors belonging to *other* worker instances — i.e. left behind by a dead worker. */
@@ -355,11 +354,6 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
       // The cached handle for the removed directory is stale; re-open everything.
       dirsPromise = undefined;
       await dirs();
-    },
-
-    totalClipBytes: async (): Promise<number> => {
-      const metas = await listClips();
-      return metas.reduce((total, meta) => total + meta.byteSize, 0);
     },
 
     writeMirror: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {

@@ -3,10 +3,10 @@ import * as React from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
-import { ClipMeta } from "./clipTypes";
+import { ClipMeta, planEviction } from "./clipTypes";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { SaveResult, SaveStatus, statusFromResult } from "./saveStatus";
-import { applyAction, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
+import { applyAction, BudgetMode, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
 
 // Extensions render plain React with no access to the app's MUI theme, so we drive
 // body colors from the watched color scheme with a small inline-style palette.
@@ -81,7 +81,47 @@ function makeTheme(scheme: ColorScheme): Theme {
 }
 
 /** Which destructive action is waiting on an inline "are you sure?" confirmation. */
-type ConfirmTarget = { kind: "clip"; id: string } | { kind: "all" } | { kind: "reset" };
+type ConfirmTarget =
+  | { kind: "clip"; id: string }
+  | { kind: "all" }
+  | { kind: "reset" }
+  /** A settled cache limit that cannot be applied without dropping cached clips. */
+  | { kind: "cacheLimit"; maxCacheMb: number; dropCount: number; dropBytes: number };
+
+/**
+ * The settings editor's number fields report every keystroke, so typing `2048` arrives as 2,
+ * then 20, then 204. Each of those would reconfigure capture: a 2 MB cache limit evicts
+ * almost everything, and a 2 second lookback throws away the buffer. Numbers therefore only
+ * reach the worker once the field has been quiet for this long.
+ */
+const SETTLE_DELAY_MS = 500;
+
+/** The numeric settings, held separately from `config` until they settle. */
+type SettledNumbers = {
+  budgetValue: number;
+  maxCacheMb: number;
+  gapThresholdSec: number;
+};
+
+function numbersOf(config: DvrConfig): SettledNumbers {
+  return {
+    budgetValue: config.budgetValue,
+    maxCacheMb: config.maxCacheMb,
+    gapThresholdSec: config.gapThresholdSec,
+  };
+}
+
+function sameNumbers(a: SettledNumbers, b: SettledNumbers): boolean {
+  return (
+    a.budgetValue === b.budgetValue &&
+    a.maxCacheMb === b.maxCacheMb &&
+    a.gapThresholdSec === b.gapThresholdSec
+  );
+}
+
+function mbToBytes(mb: number): number {
+  return Math.round(mb * 1024 * 1024);
+}
 
 /** The buffer controls fill the panel, but stop before they look stretched. */
 const CONTROL_ROW_MAX_WIDTH = 400;
@@ -596,6 +636,36 @@ function sectionTitleStyle(theme: Theme): React.CSSProperties {
   };
 }
 
+/** Outlined notice inside the pinned zone, for things the user must not scroll past. */
+function Banner({
+  color,
+  role,
+  children,
+}: {
+  color: string;
+  role?: "alert";
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <div
+      role={role}
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: "0.4rem",
+        marginTop: "0.4rem",
+        padding: "0.3rem 0.4rem",
+        border: `1px solid ${color}`,
+        color,
+        fontSize: "0.75rem",
+        lineHeight: 1.35,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 type ClipRowProps = {
   theme: Theme;
   clip: ClipMeta;
@@ -734,15 +804,19 @@ function bufferStatus(
   return { label: "Recording", active: true };
 }
 
-function statSummary(stat: WorkerStat, config: DvrConfig): { used: string; cap: string } {
-  if (config.budgetMode === "time") {
+/** `budget` is the lookback actually in force — the settled value, not a half-typed one. */
+function statSummary(
+  stat: WorkerStat,
+  budget: { mode: BudgetMode; value: number },
+): { used: string; cap: string } {
+  if (budget.mode === "time") {
     const spanNanos = BigInt(stat.newestNanos) - BigInt(stat.oldestNanos);
     // Floor at zero so a transient backward time jump can never render negative.
     const usedSec = stat.bufferedMsgs > 0 ? Math.max(0, Number(spanNanos) / 1e9) : 0;
-    return { used: `${usedSec.toFixed(1)}s`, cap: `${config.budgetValue}s` };
+    return { used: `${usedSec.toFixed(1)}s`, cap: `${budget.value}s` };
   }
   const usedMb = stat.byteTotal / (1024 * 1024);
-  return { used: `${usedMb.toFixed(2)} MB`, cap: `${config.budgetValue} MB` };
+  return { used: `${usedMb.toFixed(2)} MB`, cap: `${budget.value} MB` };
 }
 
 function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.Element {
@@ -770,6 +844,13 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [cache, setCache] = useState<CacheStatus>(UNKNOWN_CACHE);
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [confirming, setConfirming] = useState<ConfirmTarget | undefined>(undefined);
+  // The numeric settings currently in force (see SETTLE_DELAY_MS).
+  const [settled, setSettled] = useState<SettledNumbers>(() =>
+    numbersOf({
+      ...DEFAULT_CONFIG,
+      ...(context.initialState as Partial<DvrConfig> | undefined),
+    }),
+  );
   // Collapsed by default: the pinned status line already carries the state that matters,
   // and a panel sharing a layout with others is usually short.
   const [showDetails, setShowDetails] = useState(false);
@@ -788,6 +869,8 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   topicsRef.current = topics;
   const clipsRef = useRef(clips);
   clipsRef.current = clips;
+  const settledRef = useRef(settled);
+  settledRef.current = settled;
 
   const enabledTopics = useMemo(
     () => topics.filter((topic) => !config.disabledTopics.includes(topic.name)),
@@ -978,29 +1061,75 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     context.subscribe(enabledTopics.map((topic) => ({ topic: topic.name })));
   }, [context, enabledTopics]);
 
-  // Push the latest config (resolved budget bounds + enabled set) to the worker.
-  useEffect(() => {
-    const worker = workerRef.current;
-    if (!worker) {
-      return;
-    }
+  // What the worker is actually configured with. Built from the *settled* numbers, so an
+  // in-progress edit never reconfigures capture, and memoized so a keystroke that changes
+  // nothing effective does not re-post the config at all.
+  const workerConfig = useMemo(() => {
     // Auto-save is only effective when a save folder is set; otherwise every rotation
     // would dump to the native download dialog. Never send autoSave:true without a
     // folder so a stale persisted flag can't trigger download-dialog rotations.
     const autoSaveEffective = config.autoSave && saveFolderName != undefined;
-    worker.postMessage({
+    return {
       type: "config",
       budgetMode: config.budgetMode,
       budgetNanos:
-        config.budgetMode === "time" ? BigInt(Math.round(config.budgetValue * 1e9)) : undefined,
-      budgetBytes:
-        config.budgetMode === "bytes" ? Math.round(config.budgetValue * 1024 * 1024) : undefined,
+        config.budgetMode === "time" ? BigInt(Math.round(settled.budgetValue * 1e9)) : undefined,
+      budgetBytes: config.budgetMode === "bytes" ? mbToBytes(settled.budgetValue) : undefined,
       autoSave: autoSaveEffective,
       enabledTopics: enabledTopics.map((topic) => topic.name),
-      maxCacheBytes: Math.round(config.maxCacheMb * 1024 * 1024),
-      gapMs: Math.round(config.gapThresholdSec * 1000),
+      maxCacheBytes: mbToBytes(settled.maxCacheMb),
+      gapMs: Math.round(settled.gapThresholdSec * 1000),
+    };
+  }, [config.budgetMode, config.autoSave, settled, enabledTopics, saveFolderName]);
+
+  useEffect(() => {
+    workerRef.current?.postMessage(workerConfig);
+  }, [workerConfig, workerReady]);
+
+  // Promote edited numbers once the field settles. Lowering the cache limit below what is
+  // already cached would evict clips, so that one asks first instead of applying; everything
+  // else takes effect straight away.
+  useEffect(() => {
+    const pending = numbersOf(config);
+    if (sameNumbers(pending, settled)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      const doomed = planEviction(clipsRef.current ?? [], mbToBytes(pending.maxCacheMb));
+      if (pending.maxCacheMb !== settled.maxCacheMb && doomed.length > 0) {
+        // Apply the harmless numbers now and hold the cache limit for confirmation.
+        setSettled({ ...pending, maxCacheMb: settled.maxCacheMb });
+        setConfirming({
+          kind: "cacheLimit",
+          maxCacheMb: pending.maxCacheMb,
+          dropCount: doomed.length,
+          dropBytes: doomed.reduce((total, clip) => total + clip.byteSize, 0),
+        });
+        return;
+      }
+      setSettled(pending);
+      setConfirming((previous) => (previous?.kind === "cacheLimit" ? undefined : previous));
+    }, SETTLE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [config, settled]);
+
+  /** Apply a held-back cache limit, letting the worker evict down to it. */
+  const onApplyCacheLimit = useCallback((maxCacheMb: number) => {
+    setSettled((previous) => ({ ...previous, maxCacheMb }));
+    setConfirming(undefined);
+  }, []);
+
+  /** Abandon a held-back cache limit and put the old number back in the settings editor. */
+  const onCancelCacheLimit = useCallback(() => {
+    setConfirming(undefined);
+    setConfig((previous) => {
+      const restored = { ...previous, maxCacheMb: settledRef.current.maxCacheMb };
+      context.saveState(restored);
+      return restored;
     });
-  }, [config, enabledTopics, workerReady, saveFolderName]);
+  }, [context]);
 
   // Stable settings-editor action handler (reads latest config/topics via refs).
   const actionHandler = useCallback(
@@ -1152,7 +1281,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     });
   }, []);
 
-  const budget = statSummary(stat, config);
+  const budget = statSummary(stat, { mode: config.budgetMode, value: settled.budgetValue });
   const captureOn = workerReady && enabledTopics.length > 0;
   const saveDestination = saveFolderName ?? "Browser download";
   const theme = makeTheme(colorScheme);
@@ -1169,7 +1298,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     lastSave != undefined && lastSave.severity !== "ok"
       ? { text: lastSave.text, color: lastSave.severity === "error" ? theme.danger : theme.warn }
       : undefined;
-  const capBytes = Math.round(config.maxCacheMb * 1024 * 1024);
+  const capBytes = mbToBytes(settled.maxCacheMb);
   const fillStyle: React.CSSProperties = { flex: `1 1 120px` };
 
   const statRows: Array<{ label: string; value: React.ReactNode }> = [
@@ -1310,20 +1439,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             easy to miss in a muted stat row, so it stays pinned and coloured until either
             the next successful save replaces it or the user dismisses it. */}
         {alert != undefined && (
-          <div
-            role="alert"
-            style={{
-              display: "flex",
-              alignItems: "flex-start",
-              gap: "0.4rem",
-              marginTop: "0.4rem",
-              padding: "0.3rem 0.4rem",
-              border: `1px solid ${alert.color}`,
-              color: alert.color,
-              fontSize: "0.75rem",
-              lineHeight: 1.35,
-            }}
-          >
+          <Banner color={alert.color} role="alert">
             <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>{alert.text}</span>
             <ThemedButton
               theme={theme}
@@ -1336,7 +1452,37 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             >
               ✕
             </ThemedButton>
-          </div>
+          </Banner>
+        )}
+
+        {/* Lowering the cache limit past what is already cached would evict clips, so it is
+            held here until the user agrees. The number field itself lives in the app's
+            settings editor, which the panel cannot render into. */}
+        {confirming?.kind === "cacheLimit" && (
+          <Banner color={theme.warn}>
+            <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>
+              A {confirming.maxCacheMb} MB cache limit will drop {confirming.dropCount} cached clip
+              {confirming.dropCount === 1 ? "" : "s"} ({formatBytes(confirming.dropBytes)}). Apply?
+            </span>
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              style={{ color: theme.warn }}
+              onClick={() => {
+                onApplyCacheLimit(confirming.maxCacheMb);
+              }}
+            >
+              Apply
+            </ThemedButton>
+            <ThemedButton
+              theme={theme}
+              variant="link"
+              style={{ color: theme.warn }}
+              onClick={onCancelCacheLimit}
+            >
+              Cancel
+            </ThemedButton>
+          </Banner>
         )}
       </div>
 
@@ -1447,7 +1593,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           fontSize: "0.75rem",
         }}
       >
-        {formatBytes(cacheBytes)} / {config.maxCacheMb} MB · {cacheModeLabel(cache)}
+        {formatBytes(cacheBytes)} / {settled.maxCacheMb} MB · {cacheModeLabel(cache)}
       </p>
 
       {hasClips ? (

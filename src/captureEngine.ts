@@ -25,7 +25,7 @@
 // writer, no overlapping builds, and deterministic ordering for the tests.
 
 import { buildMcap, DvrRecord, DvrSchema } from "./buildMcap";
-import { ClipMeta, ClipTrigger, PanelTrigger } from "./clipTypes";
+import { ClipMeta, ClipTrigger, PanelTrigger, planEviction } from "./clipTypes";
 import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
 import { ClipStore, ClipStoreMode } from "./opfsStore";
 import { resolveSchema } from "./schemaRegistry";
@@ -554,24 +554,17 @@ export class CaptureEngine {
     if (cap == undefined) {
       return false;
     }
-    let total = await this.#store.totalClipBytes();
-    const clips = await this.#store.listClips();
-    const victims = [...clips].sort(compareEvictionOrder);
-    let remaining = clips.length;
-    let evicted = false;
-    for (const victim of victims) {
-      if (total <= cap || remaining <= 1) {
-        break;
-      }
+    // Same plan the panel previews when the user lowers the limit, so what it warned about
+    // is exactly what happens here.
+    const doomed = planEviction(await this.#store.listClips(), cap);
+    for (const victim of doomed) {
       await this.#store.deleteClip(victim.id);
-      total -= victim.byteSize;
-      remaining--;
-      evicted = true;
     }
-    if (evicted) {
+    if (doomed.length > 0) {
       this.#clips = await this.#store.listClips();
+      return true;
     }
-    return evicted;
+    return false;
   }
 
   #buildMeta(
@@ -870,16 +863,6 @@ export class CaptureEngine {
       await operation();
     });
   }
-}
-
-/** Eviction order: `recovered` clips first, then oldest first. */
-function compareEvictionOrder(a: ClipMeta, b: ClipMeta): number {
-  const aRank = a.trigger === "recovered" ? 0 : 1;
-  const bRank = b.trigger === "recovered" ? 0 : 1;
-  if (aRank !== bRank) {
-    return aRank - bRank;
-  }
-  return a.createdAt - b.createdAt;
 }
 
 function toNanos(time?: Time): bigint {

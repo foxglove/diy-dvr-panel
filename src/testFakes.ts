@@ -88,8 +88,6 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
     clearClips: async (): Promise<void> => {
       backing.clips.clear();
     },
-    totalClipBytes: async (): Promise<number> =>
-      sorted().reduce((total, meta) => total + meta.byteSize, 0),
     writeMirror: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
       backing.mirrors.set(instanceId, { meta, bytes: bytes.slice() });
     },
