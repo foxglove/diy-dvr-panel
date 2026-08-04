@@ -33,6 +33,23 @@ export type ClipTrigger =
 export type PanelTrigger = "backgrounded" | "closing" | "manual-clip";
 
 /**
+ * The sidecar for a live mirror, which is a clip plus a liveness heartbeat.
+ *
+ * Whether a mirror may be promoted cannot be answered by trying to delete it: OPFS only holds
+ * the exclusive lock for the moment a write is in flight, so a *live* sibling's mirror is
+ * deletable almost all of the time. Promoting it would destroy the crash backstop of a panel
+ * that is still running. So the owner stamps `updatedAt` on every write and a would-be
+ * promoter only takes a mirror that has stopped being refreshed.
+ */
+export type MirrorMeta = ClipMeta & {
+  /**
+   * Wall-clock ms of the last mirror write. Absent on mirrors written by an older build,
+   * which are treated as stale — they belong to a worker from a previous session.
+   */
+  updatedAt?: number;
+};
+
+/**
  * Everything known about one cached clip. Written to OPFS as a JSON sidecar next to the
  * MCAP bytes, and broadcast to the panel verbatim.
  *

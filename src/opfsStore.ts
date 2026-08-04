@@ -30,7 +30,7 @@
 // desktop builds, so both paths are implemented behind one API and the store reports
 // which one is live via `mode()`.
 
-import { ClipMeta } from "./clipTypes";
+import { ClipMeta, MirrorMeta } from "./clipTypes";
 
 const ROOT_DIR = "diy-dvr";
 const CLIPS_DIR = "clips";
@@ -74,11 +74,13 @@ type OpfsCapableStorage = { getDirectory?: () => Promise<FileSystemDirectoryHand
 /** Which OPFS access path is live. `unknown` until the first successful `init()`. */
 export type ClipStoreMode = "unknown" | "sync" | "async" | "unavailable";
 
-/** A mirror file with its metadata, as found on disk. */
+/**
+ * Another worker's mirror, as found on disk. Metadata only: deciding whether a mirror may be
+ * promoted needs just its heartbeat, and its payload can be gigabytes.
+ */
 export type MirrorEntry = {
   instanceId: string;
-  meta: ClipMeta;
-  bytes: Uint8Array;
+  meta: MirrorMeta;
 };
 
 /**
@@ -102,12 +104,18 @@ export type ClipStore = {
   readClip: (id: string) => Promise<Uint8Array | undefined>;
   deleteClip: (id: string) => Promise<void>;
   clearClips: () => Promise<void>;
-  /** Overwrite this instance's mirror of the live ring buffer. */
-  writeMirror: (meta: ClipMeta, bytes: Uint8Array) => Promise<void>;
-  /** Mirrors belonging to *other* worker instances — i.e. left behind by a dead worker. */
+  /** Overwrite this instance's mirror of the live ring buffer, heartbeat included. */
+  writeMirror: (meta: MirrorMeta, bytes: Uint8Array) => Promise<void>;
+  /** Mirrors belonging to *other* worker instances. Liveness is judged by their heartbeat. */
   listOrphanMirrors: () => Promise<MirrorEntry[]>;
-  /** Delete a mirror. Defaults to this instance's own. */
-  clearMirror: (instanceId?: string) => Promise<void>;
+  /** The payload of one mirror, read only once it is worth promoting. */
+  readMirror: (instanceId: string) => Promise<Uint8Array | undefined>;
+  /**
+   * Delete a mirror, defaulting to this instance's own. Resolves `true` when this call is the
+   * one that removed the sidecar, which is how two workers restarting at once settle who owns
+   * the recovery: the loser sees `false` and must not promote the same bytes a second time.
+   */
+  clearMirror: (instanceId?: string) => Promise<boolean>;
 };
 
 /**
@@ -330,7 +338,14 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
       await withDirs(async ({ clips }) => {
         await writeFile(clips, meta.id + CLIP_EXT, bytes);
-        await writeFile(clips, meta.id + META_EXT, encodeMeta(meta));
+        try {
+          await writeFile(clips, meta.id + META_EXT, encodeMeta(meta));
+        } catch (err) {
+          // Without its sidecar the payload is invisible to listClips but still consumes the
+          // quota, so a failure here (running out of room, most likely) must not leave it.
+          await removeIfPresent(clips, meta.id + CLIP_EXT);
+          throw err;
+        }
       });
     },
 
@@ -356,7 +371,7 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
       await dirs();
     },
 
-    writeMirror: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
+    writeMirror: async (meta: MirrorMeta, bytes: Uint8Array): Promise<void> => {
       await withDirs(async ({ mirror }) => {
         await writeFile(mirror, ownId + MIRROR_EXT, bytes);
         await writeFile(mirror, ownId + META_EXT, encodeMeta(meta));
@@ -366,31 +381,32 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     listOrphanMirrors: async (): Promise<MirrorEntry[]> =>
       await withDirs(async ({ mirror }) => {
         const found = await readIndex(mirror, MIRROR_EXT);
-        const orphans: MirrorEntry[] = [];
-        for (const entry of found) {
-          if (entry.id === ownId) {
-            continue; // our own live mirror
-          }
-          try {
-            const bytes = await readFile(mirror, entry.id + MIRROR_EXT);
-            if (bytes != undefined) {
-              orphans.push({ instanceId: entry.id, meta: entry.meta, bytes });
-            }
-          } catch {
-            // Unreadable, typically because a live panel holds the file. Skip it rather than
-            // failing the whole rehydrate; the cached clips still load.
-          }
-        }
-        return orphans.sort((a, b) => compareByCreation(a.meta, b.meta));
+        return found
+          .filter((entry) => entry.id !== ownId)
+          .map((entry) => ({ instanceId: entry.id, meta: entry.meta }))
+          .sort((a, b) => compareByCreation(a.meta, b.meta));
       }),
 
-    clearMirror: async (instanceToClear?: string): Promise<void> => {
+    readMirror: async (instanceToRead: string): Promise<Uint8Array | undefined> =>
+      await withDirs(async ({ mirror }) => {
+        try {
+          return await readFile(mirror, sanitizeId(instanceToRead) + MIRROR_EXT);
+        } catch {
+          // Unreadable, most likely because its owner holds the file mid-write. Treat it as
+          // absent rather than failing the caller.
+          return undefined;
+        }
+      }),
+
+    clearMirror: async (instanceToClear?: string): Promise<boolean> =>
       await withDirs(async ({ mirror }) => {
         const id = instanceToClear == undefined ? ownId : sanitizeId(instanceToClear);
-        await removeIfPresent(mirror, id + META_EXT);
+        // The sidecar is the claim marker: whoever removes it owns the recovery. A caller
+        // that finds it already gone lost the race and must not promote.
+        const claimed = await removeIfPresent(mirror, id + META_EXT);
         await removeIfPresent(mirror, id + MIRROR_EXT);
-      });
-    },
+        return claimed;
+      }),
   };
 }
 
@@ -433,17 +449,20 @@ function compareByCreation(a: ClipMeta, b: ClipMeta): number {
   return a.id < b.id ? -1 : 1;
 }
 
+/** Remove an entry, resolving whether it was actually there to remove. */
 async function removeIfPresent(
   dir: FileSystemDirectoryHandle,
   name: string,
   options?: FileSystemRemoveOptions,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await dir.removeEntry(name, options);
+    return true;
   } catch (err) {
     if (!isNotFound(err)) {
       throw err;
     }
+    return false;
   }
 }
 

@@ -98,6 +98,8 @@ export type CaptureEngineDeps = {
   mirrorIntervalMs?: number;
   /** Retry backoff. Injected so tests do not wait on real timers. */
   delay?: (ms: number) => Promise<void>;
+  /** How long `store.init()` may take before the cache is declared unusable. */
+  initTimeoutMs?: number;
 };
 
 /** Per topic: a real schema resolved from the registry, or an inferred, merged one. */
@@ -112,6 +114,24 @@ const TRIGGER_LABELS: Record<Exclude<ClipTrigger, "gap">, string> = {
 };
 
 /**
+ * How many mirror intervals a mirror may go unrefreshed before another worker treats it as
+ * abandoned. Recovery is delayed by this much, which is the price of never stealing a live
+ * panel's backstop.
+ */
+const MIRROR_STALE_INTERVALS = 3;
+
+/**
+ * Ceiling on how much wall time mirroring may consume, as a multiple of its own measured cost.
+ * Framing and writing a multi-GB ring takes seconds, and on a fixed timer that work would grow
+ * without bound as the ring does; waiting this many times the last mirror's duration keeps it
+ * to roughly 1/(1 + N) of the time whatever the ring's size.
+ */
+const MIRROR_COST_MULTIPLIER = 9;
+
+/** How long to wait for the durable store to open before giving up on it. */
+const DEFAULT_INIT_TIMEOUT_MS = 10_000;
+
+/**
  * Backoff before retrying a failed rehydrate step. The usual cause is OPFS exclusive-lock
  * contention with a worker that is still shutting down, which clears in milliseconds.
  */
@@ -123,6 +143,7 @@ export class CaptureEngine {
   readonly #emit: (message: EngineOutput, transfer?: Transferable[]) => void;
   readonly #frame: FrameFn;
   readonly #mirrorIntervalMs: number;
+  readonly #initTimeoutMs: number;
   readonly #delay: (ms: number) => Promise<void>;
   readonly #encoder = new TextEncoder();
 
@@ -158,6 +179,10 @@ export class CaptureEngine {
   // --- mirror throttle (seeded to construction time so the first mirror waits one
   // interval instead of firing on the very first tick) ---
   #lastMirrorAt: number;
+  /** When orphaned mirrors were last looked for (see `#maybeScanForOrphans`). */
+  #lastOrphanScanAt: number;
+  /** Duration of the last mirror build+write, which sets the floor on the next gap. */
+  #lastMirrorCostMs = 0;
   #mirrorInFlight = false;
   #mirroredMessageCount = -1;
 
@@ -170,12 +195,14 @@ export class CaptureEngine {
     this.#emit = deps.emit;
     this.#frame = deps.frame ?? buildMcap;
     this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
+    this.#initTimeoutMs = deps.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
     this.#delay =
       deps.delay ??
       (async (ms: number) => {
         await new Promise<void>((resolve) => setTimeout(resolve, ms));
       });
     this.#lastMirrorAt = deps.now();
+    this.#lastOrphanScanAt = deps.now();
   }
 
   // --- lifecycle ------------------------------------------------------------------
@@ -188,7 +215,9 @@ export class CaptureEngine {
   public start(): void {
     this.#enqueue(async () => {
       try {
-        await this.#store.init();
+        // A hung getDirectory() would otherwise stall this queue for good, leaving the panel
+        // on "Reading the clip cache…" with no way out.
+        await withTimeout(this.#store.init(), this.#initTimeoutMs, "open the clip cache");
       } catch (err) {
         // No durable cache here (an old build, a non-secure context, a denied quota).
         // Live capture is unaffected, so report it and carry on.
@@ -211,6 +240,7 @@ export class CaptureEngine {
       await this.#attempt("recover the previous session", async () => {
         await this.#promoteOrphanMirrors();
       });
+      this.#lastOrphanScanAt = this.#now();
       await this.#attempt("apply the clip cache limit", async () => {
         await this.#evictToCap();
       });
@@ -338,6 +368,7 @@ export class CaptureEngine {
   public tick(): void {
     this.#checkGap();
     this.#maybeMirror();
+    this.#maybeScanForOrphans();
     // Message-count-triggered stats alone can lag badly on a slow feed, and the panel
     // pins a live buffer status, so also report on the tick whenever something changed.
     if (this.#messageCount !== this.#lastStatMessageCount) {
@@ -475,6 +506,10 @@ export class CaptureEngine {
         triggerLabel: label,
         sealed: true,
       });
+      // Make room before writing rather than after. Evicting afterwards means a cache already
+      // at its cap has to survive being briefly over it — and if the write fails for want of
+      // space, the eviction that would have freed some never runs.
+      await this.#evictToCap(bytes.byteLength);
       await this.#store.writeClip(meta, bytes);
       this.#clips = await this.#store.listClips();
       await this.#evictToCap();
@@ -490,38 +525,85 @@ export class CaptureEngine {
    * it preserves the live buffer across the teardown this exists to defend against. The
    * promoted clip can be up to one mirror interval stale.
    */
-  async #promoteOrphanMirrors(): Promise<void> {
+  async #promoteOrphanMirrors(): Promise<boolean> {
     const orphans = await this.#store.listOrphanMirrors();
+    // A mirror is only abandoned once it has stopped being refreshed. Deletability cannot
+    // answer this: OPFS holds the exclusive lock only while a write is actually in flight, so
+    // a live sibling's mirror is deletable in the gaps between its writes — and taking it
+    // would destroy the crash backstop of a panel that is still running, then lose its buffer
+    // if it were torn down before writing again.
+    const staleBefore = this.#now() - this.#mirrorIntervalMs * MIRROR_STALE_INTERVALS;
     let promoted = 0;
     for (const orphan of orphans) {
-      // Claim it before promoting. Deleting the mirror is also the test for whether its
-      // owner is really gone: OPFS locks a file while a worker is writing it, so a failure
-      // here means a live panel still owns this mirror and we must not duplicate its
-      // backstop. Clearing first is safe because the bytes are already in hand.
-      try {
-        await this.#store.clearMirror(orphan.instanceId);
-      } catch {
+      const heartbeat = orphan.meta.updatedAt ?? 0;
+      if (heartbeat > staleBefore) {
+        continue; // its owner is still writing
+      }
+      if (orphan.meta.messageCount < 1) {
+        // Nothing to promote, but clear it so it is not reconsidered on every scan.
+        await this.#claimMirror(orphan.instanceId);
         continue;
       }
-      if (orphan.meta.messageCount >= 1) {
-        // An empty mirror has nothing to promote, but is still cleared above so it is not
-        // reconsidered on the next mount.
-        const meta: ClipMeta = {
-          ...orphan.meta,
-          id: this.#nextClipId(),
-          trigger: "recovered",
-          triggerLabel: TRIGGER_LABELS.recovered,
-          createdAt: this.#now(),
-          sealed: true,
-        };
-        await this.#store.writeClip(meta, orphan.bytes);
-        promoted++;
+      // Read before claiming, since claiming deletes the payload. The read is wasted only in
+      // the rare case that another worker claims it first.
+      const bytes = await this.#store.readMirror(orphan.instanceId);
+      if (bytes == undefined) {
+        continue;
       }
+      // Claiming is removing the sidecar. Two workers restarting together both see the same
+      // orphan, and only the one whose delete actually removed it may promote.
+      if (!(await this.#claimMirror(orphan.instanceId))) {
+        continue; // another worker got there first
+      }
+      const meta: ClipMeta = {
+        ...orphan.meta,
+        id: this.#nextClipId(),
+        trigger: "recovered",
+        triggerLabel: TRIGGER_LABELS.recovered,
+        createdAt: this.#now(),
+        sealed: true,
+      };
+      await this.#store.writeClip(meta, bytes);
+      promoted++;
     }
     if (promoted > 0) {
       await this.#pruneRecovered();
       this.#clips = await this.#store.listClips();
     }
+    return promoted > 0;
+  }
+
+  /** Try to take ownership of another worker's mirror. False when someone else already did. */
+  async #claimMirror(instanceId: string): Promise<boolean> {
+    try {
+      return await this.#store.clearMirror(instanceId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Look for abandoned mirrors again, long after the mount.
+   *
+   * On a reconnect the previous worker's mirror is still fresh, so `start()` correctly leaves
+   * it alone — but the window it holds would then wait for some unrelated future mount. Coming
+   * back once it has gone stale keeps recovery bounded by the staleness threshold instead.
+   */
+  #maybeScanForOrphans(): void {
+    if (!this.#cacheAvailable) {
+      return;
+    }
+    const scanIntervalMs = this.#mirrorIntervalMs * MIRROR_STALE_INTERVALS;
+    if (this.#now() - this.#lastOrphanScanAt < scanIntervalMs) {
+      return;
+    }
+    this.#lastOrphanScanAt = this.#now();
+    this.#enqueueCacheOp(async () => {
+      if (await this.#promoteOrphanMirrors()) {
+        await this.#evictToCap();
+        this.#broadcastClips();
+      }
+    });
   }
 
   /**
@@ -549,14 +631,15 @@ export class CaptureEngine {
    * for however new they are. Recovery is churn produced by reconnects, so it must never
    * cost a `gap`, `manual`, or auto-save window.
    */
-  async #evictToCap(): Promise<boolean> {
+  async #evictToCap(reserveBytes = 0): Promise<boolean> {
     const cap = this.#maxCacheBytes;
     if (cap == undefined) {
       return false;
     }
     // Same plan the panel previews when the user lowers the limit, so what it warned about
-    // is exactly what happens here.
-    const doomed = planEviction(await this.#store.listClips(), cap);
+    // is exactly what happens here. `reserveBytes` leaves room for a clip about to be written.
+    const target = Math.max(0, cap - reserveBytes);
+    const doomed = planEviction(await this.#store.listClips(), target);
     for (const victim of doomed) {
       await this.#store.deleteClip(victim.id);
     }
@@ -658,7 +741,13 @@ export class CaptureEngine {
     if (this.#messageCount === this.#mirroredMessageCount) {
       return; // nothing new since the last mirror
     }
-    if (this.#now() - this.#lastMirrorAt < this.#mirrorIntervalMs) {
+    // The interval is a floor, not a promise: once a mirror costs real time, wait in
+    // proportion to that cost so the work cannot grow with the ring on a fixed timer.
+    const minimumGapMs = Math.max(
+      this.#mirrorIntervalMs,
+      this.#lastMirrorCostMs * MIRROR_COST_MULTIPLIER,
+    );
+    if (this.#now() - this.#lastMirrorAt < minimumGapMs) {
       return;
     }
     const snapshot = this.#records.slice();
@@ -669,6 +758,7 @@ export class CaptureEngine {
     // Unguarded `#enqueue` on purpose: the in-flight flag must be released even when the
     // cache turned out to be unusable while this was queued.
     this.#enqueue(async () => {
+      const startedAt = this.#now();
       try {
         if (!this.#cacheAvailable) {
           return;
@@ -679,10 +769,15 @@ export class CaptureEngine {
           triggerLabel: TRIGGER_LABELS.recovered,
           sealed: false,
         });
-        await this.#store.writeMirror(meta, bytes);
+        // The heartbeat is what tells another worker this mirror is still being tended.
+        await this.#store.writeMirror({ ...meta, updatedAt: this.#now() }, bytes);
         this.#mirroredMessageCount = mirroredCount;
       } finally {
         this.#mirrorInFlight = false;
+        this.#lastMirrorCostMs = Math.max(0, this.#now() - startedAt);
+        // Measure the gap from the end of the work, not its start, so a slow mirror does not
+        // immediately become eligible again.
+        this.#lastMirrorAt = this.#now();
       }
     });
   }
@@ -868,6 +963,29 @@ export class CaptureEngine {
   }
 }
 
+/** Reject if `work` has not settled within `ms`. The timer is always cleared. */
+async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  // Collected rather than held in a `let`, so the always-run cleanup does not depend on
+  // control-flow analysis reaching into the executor.
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timers.push(
+          setTimeout(() => {
+            reject(new Error(`Timed out trying to ${what}`));
+          }, ms),
+        );
+      }),
+    ]);
+  } finally {
+    for (const timer of timers) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function toNanos(time?: Time): bigint {
   if (time == undefined) {
     return 0n;
@@ -895,7 +1013,13 @@ function toBase64(view: ArrayBufferView): string {
 
 function jsonReplacer(_key: string, value: unknown): unknown {
   if (typeof value === "bigint") {
-    return Number(value);
+    // JSON has no 64-bit integer. Within the double-safe range a number is what consumers
+    // expect from an integer field, but past it a number would be a *different* value — so
+    // emit the exact decimal string instead of silently rounding. (inferSchema already types
+    // bigint fields as strings, so a string is the more consistent of the two.)
+    return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(value)
+      : value.toString();
   }
   // Unsigned byte arrays -> base64 string (matches contentEncoding:base64 in the schema).
   // Int8Array is intentionally NOT base64'd: the app's normalizeInt8Array

@@ -41,6 +41,7 @@ function harness(
     clock?: FakeClock;
     frame?: FrameFn;
     mirrorIntervalMs?: number;
+    initTimeoutMs?: number;
     storeOptions?: FakeStoreOptions;
   } = {},
 ): Harness {
@@ -54,6 +55,7 @@ function harness(
     emit: out.emit,
     frame: opts.frame ?? sizedFrame(128),
     mirrorIntervalMs: opts.mirrorIntervalMs ?? NO_MIRROR,
+    initTimeoutMs: opts.initTimeoutMs,
     // Retry backoff without real timers.
     delay: async () => {
       await Promise.resolve();
@@ -619,30 +621,219 @@ describe("durability across a worker teardown", () => {
     expect(backing.mirrors.size).toBe(0);
   });
 
-  it("leaves a mirror it cannot claim to its live owner", async () => {
-    // Two panels share the origin's cache. A mirror that cannot be deleted is still held
-    // by a running worker, so promoting it would duplicate a live panel's backstop.
+  it("leaves a still-heartbeating sibling's mirror alone", async () => {
+    // The case that matters: a second DIY DVR panel mounts while the first is running. The
+    // first panel's mirror is *deletable* almost all the time — OPFS only locks it for the
+    // instant of a write — so liveness has to come from the heartbeat. Taking it would destroy
+    // a running panel's crash backstop, and lose its buffer if it were then torn down.
     const backing = createFakeBacking();
+    const clock = createFakeClock();
     backing.mirrors.set("live-sibling", {
-      meta: makeMirrorMeta({ messageCount: 4 }),
+      meta: makeMirrorMeta({ messageCount: 4, updatedAt: clock.now() - 1000 }),
       bytes: new Uint8Array([1, 2]),
     });
 
     const { engine, out } = harness({
       backing,
-      storeOptions: {
-        instanceId: "this-worker",
-        lockedMirrors: new Set(["live-sibling"]),
-      },
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "this-worker" },
     });
     engine.start();
     await engine.whenIdle();
 
     expect(backing.clips.size).toBe(0);
     expect(backing.mirrors.has("live-sibling")).toBe(true);
-    // Contention is expected here, not something to alarm the user about.
+    // A sibling being alive is normal, not something to alarm the user about.
     expect(out.all("error")).toHaveLength(0);
     expect(out.last("clips")?.cache.available).toBe(true);
+  });
+
+  it("promotes a mirror once its heartbeat has gone stale", async () => {
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    backing.mirrors.set("dead-worker", {
+      meta: makeMirrorMeta({ messageCount: 4, updatedAt: clock.now() - 60_000 }),
+      bytes: new Uint8Array([1, 2]),
+    });
+
+    const { engine } = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "this-worker" },
+    });
+    engine.start();
+    await engine.whenIdle();
+
+    expect(storedClips(backing)[0]?.trigger).toBe("recovered");
+    expect(backing.mirrors.size).toBe(0);
+  });
+
+  it("waits out the staleness threshold rather than promoting the moment it is quiet", async () => {
+    // Just-missed-a-beat is not the same as gone, so a mirror one interval old is left alone.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    backing.mirrors.set("maybe-alive", {
+      meta: makeMirrorMeta({ messageCount: 4, updatedAt: clock.now() - 6000 }),
+      bytes: new Uint8Array([1, 2]),
+    });
+
+    const { engine } = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "this-worker" },
+    });
+    engine.start();
+    await engine.whenIdle();
+    expect(backing.clips.size).toBe(0);
+
+    // Past three intervals with no refresh, it is fair game.
+    clock.advance(10_000);
+    const second = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "another-worker" },
+    });
+    second.engine.start();
+    await second.engine.whenIdle();
+    expect(storedClips(backing)[0]?.trigger).toBe("recovered");
+  });
+
+  it("keeps a live mirror fresh by writing a heartbeat on every mirror", async () => {
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    const { engine } = harness({ backing, clock, frame: sizedFrame(64), mirrorIntervalMs: 5000 });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+
+    const first = backing.mirrors.get("instance-a")?.meta.updatedAt;
+    expect(first).toBe(clock.now());
+
+    engine.addMessage(makeMsg("/a", 101));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+    expect(backing.mirrors.get("instance-a")?.meta.updatedAt).toBe(clock.now());
+    expect(backing.mirrors.get("instance-a")?.meta.updatedAt).toBeGreaterThan(first ?? 0);
+  });
+
+  it("comes back for a mirror that goes stale after the mount", async () => {
+    // On a reconnect the previous worker's mirror is still fresh, so start() correctly leaves
+    // it be. Without a later look the window it holds would wait for some unrelated future
+    // mount; instead recovery lands once the staleness threshold has passed.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    backing.mirrors.set("just-terminated", {
+      meta: makeMirrorMeta({ messageCount: 3, updatedAt: clock.now() - 500 }),
+      bytes: new Uint8Array([1, 2, 3]),
+    });
+
+    const { engine, out } = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "replacement" },
+    });
+    engine.start();
+    engine.configure(config());
+    await engine.whenIdle();
+
+    // Too soon: as far as this worker knows, that mirror's owner may still be alive.
+    expect(backing.clips.size).toBe(0);
+
+    clock.advance(20_000);
+    engine.tick();
+    await engine.whenIdle();
+
+    const clips = storedClips(backing);
+    expect(clips).toHaveLength(1);
+    expect(clips[0]?.trigger).toBe("recovered");
+    expect(backing.mirrors.size).toBe(0);
+    // The panel is told, rather than finding out on its next mutation.
+    expect(out.last("clips")?.clips.map((clip) => clip.trigger)).toEqual(["recovered"]);
+  });
+
+  it("does not read a live sibling's payload at all", async () => {
+    // Reading a mirror can mean reading a gigabyte, so a mirror that is not promotable must be
+    // judged from its heartbeat alone — never by fetching its bytes to find out.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    const refreshSibling = () => {
+      backing.mirrors.set("live-sibling", {
+        meta: makeMirrorMeta({ messageCount: 3, updatedAt: clock.now() }),
+        bytes: new Uint8Array([1, 2, 3]),
+      });
+    };
+    refreshSibling();
+
+    const reads: string[] = [];
+    const { engine } = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "watcher", onReadMirror: (id) => reads.push(id) },
+    });
+    engine.start();
+    engine.configure(config());
+    await engine.whenIdle();
+
+    // The sibling keeps writing, as a running worker does, so every scan sees it as fresh.
+    for (let i = 0; i < 4; i++) {
+      clock.advance(5000);
+      refreshSibling();
+      engine.tick();
+      await engine.whenIdle();
+    }
+
+    expect(reads).toEqual([]);
+    expect(backing.clips.size).toBe(0);
+    expect(backing.mirrors.has("live-sibling")).toBe(true);
+  });
+
+  it("does not double-promote when two workers restart at the same moment", async () => {
+    // Both see the same stale orphan. Claiming is removing the sidecar, so only the worker
+    // whose delete actually removed it may promote; the loser must not write a second copy.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    backing.mirrors.set("dead-worker", {
+      meta: makeMirrorMeta({ messageCount: 4, updatedAt: 0 }),
+      bytes: new Uint8Array([1, 2]),
+    });
+
+    const first = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: { instanceId: "worker-one" },
+    });
+    // Deterministic interleave: the second worker has already listed the orphan when the first
+    // one runs its whole rehydrate and claims it.
+    const second = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      storeOptions: {
+        instanceId: "worker-two",
+        beforeListOrphanMirrors: async () => {
+          first.engine.start();
+          await first.engine.whenIdle();
+        },
+      },
+    });
+
+    second.engine.start();
+    await second.engine.whenIdle();
+
+    const recovered = storedClips(backing).filter((clip) => clip.trigger === "recovered");
+    expect(recovered).toHaveLength(1);
+    expect(backing.mirrors.size).toBe(0);
   });
 
   it("leaves its own live mirror alone", async () => {
@@ -1042,5 +1233,137 @@ describe("per-topic byte metadata", () => {
     expect(Object.values(meta?.topicBytes ?? {}).reduce((a, b) => a + b, 0)).toBe(
       engine.stats().byteTotal,
     );
+  });
+});
+
+describe("bounded mirror cost", () => {
+  it("waits in proportion to what the last mirror cost", async () => {
+    // On a fixed timer, mirroring a multi-GB ring would consume most of the wall clock as the
+    // ring grows. The gap scales with the measured cost instead, so the share stays bounded.
+    const clock = createFakeClock();
+    const backing = createFakeBacking();
+    let frames = 0;
+    const { engine } = harness({
+      backing,
+      clock,
+      mirrorIntervalMs: 5000,
+      frame: async () => {
+        frames++;
+        clock.advance(2000); // this mirror took two seconds
+        return new Uint8Array(64);
+      },
+    });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100));
+
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+    expect(frames).toBe(1);
+
+    // One interval later is no longer enough: 2 s of work earns a 18 s gap.
+    engine.addMessage(makeMsg("/a", 101));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+    expect(frames).toBe(1);
+
+    clock.advance(13_000);
+    engine.tick();
+    await engine.whenIdle();
+    expect(frames).toBe(2);
+  });
+
+  it("still mirrors on the plain interval when the work is cheap", async () => {
+    const clock = createFakeClock();
+    let frames = 0;
+    const { engine } = harness({
+      clock,
+      mirrorIntervalMs: 5000,
+      frame: async () => {
+        frames++;
+        return new Uint8Array(64);
+      },
+    });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+    engine.addMessage(makeMsg("/a", 101));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+    expect(frames).toBe(2);
+  });
+});
+
+describe("writing into a full cache", () => {
+  it("frees room before writing rather than after", async () => {
+    // Evicting only after the write means a cache at its cap has to survive being over it —
+    // and if the write fails for want of space, the eviction that would have freed some
+    // never runs.
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    const { engine, out } = harness({
+      backing,
+      clock,
+      frame: sizedFrame(100),
+      storeOptions: { quotaBytes: 250 },
+    });
+    engine.start();
+    engine.configure(config({ maxCacheBytes: 250 }));
+    engine.addMessage(makeMsg("/a", 100));
+
+    for (let i = 0; i < 4; i++) {
+      engine.createClip("manual-clip");
+      await engine.whenIdle();
+      clock.advance(1000);
+    }
+
+    // Every write landed; nothing hit the quota.
+    expect(out.all("error")).toHaveLength(0);
+    const total = storedClips(backing).reduce((sum, clip) => sum + clip.byteSize, 0);
+    expect(total).toBeLessThanOrEqual(250);
+    expect(backing.clips.size).toBeGreaterThan(0);
+  });
+});
+
+describe("durable store that never opens", () => {
+  it("gives up after the timeout instead of stalling the panel", async () => {
+    // A hung getDirectory() would otherwise leave the queue parked forever and the panel
+    // showing "Reading the clip cache…" with no way out.
+    const { engine, out } = harness({
+      initTimeoutMs: 5,
+      storeOptions: { hangInit: true },
+    });
+    engine.start();
+    await engine.whenIdle();
+
+    expect(out.last("error")?.message).toContain("Timed out");
+    expect(out.last("clips")).toMatchObject({ clips: [], cache: { available: false } });
+    // Live capture is untouched by a cache that never opened.
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100));
+    expect(engine.stats().bufferedMsgs).toBe(1);
+  });
+});
+
+describe("64-bit integer fields", () => {
+  it("keeps a value that a double cannot hold exactly", () => {
+    const { engine } = harness();
+    engine.configure(config());
+    const huge = 9_007_199_254_740_993n; // 2^53 + 1, not representable as a double
+    engine.addMessage(makeMsg("/a", 100, { message: { small: 42n, huge } }));
+
+    const encoded = new TextDecoder().decode(engine.bufferedRecords()[0]?.data);
+    const parsed = JSON.parse(encoded) as { small: unknown; huge: unknown };
+    // Within the safe range a number is what an integer field's consumers expect.
+    expect(parsed.small).toBe(42);
+    // Beyond it, the exact digits are kept rather than a silently different number.
+    expect(parsed.huge).toBe("9007199254740993");
+    expect(encoded).not.toContain("9007199254740992");
   });
 });

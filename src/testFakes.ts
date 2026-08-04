@@ -9,16 +9,17 @@
 // freshly-created worker sees what OPFS kept after the previous one was terminated.
 
 import { EngineInboundMsg, EngineOutput, FrameFn } from "./captureEngine";
-import { ClipMeta } from "./clipTypes";
+import { ClipMeta, MirrorMeta } from "./clipTypes";
 import { ClipStore, ClipStoreMode, MirrorEntry } from "./opfsStore";
 
 type StoredFile = { meta: ClipMeta; bytes: Uint8Array };
+type StoredMirror = { meta: MirrorMeta; bytes: Uint8Array };
 
 /** The shared in-memory disk. Survives any number of store views over it. */
 export type FakeBacking = {
   clips: Map<string, StoredFile>;
   /** Keyed by the owning worker-instance id. */
-  mirrors: Map<string, StoredFile>;
+  mirrors: Map<string, StoredMirror>;
 };
 
 export function createFakeBacking(): FakeBacking {
@@ -34,10 +35,19 @@ export type FakeStoreOptions = {
   /** Make `writeClip()` reject, as a quota failure would. */
   failWrites?: boolean;
   /**
-   * Mirrors that cannot be deleted, as OPFS reports while another worker holds the file.
-   * Keyed by owning instance id.
+   * Total byte ceiling the backing can hold, standing in for the origin's storage quota: a
+   * `writeClip` that would exceed it rejects, exactly as a full disk does.
    */
-  lockedMirrors?: Set<string>;
+  quotaBytes?: number;
+  /** Make `init()` hang forever, to exercise the init timeout. */
+  hangInit?: boolean;
+  /** Notified whenever a mirror payload is read, so a test can assert it is not. */
+  onReadMirror?: (instanceId: string) => void;
+  /**
+   * Runs before `listOrphanMirrors()` resolves. Lets a test interleave a second worker at the
+   * exact point where both have seen the same orphan but neither has claimed it yet.
+   */
+  beforeListOrphanMirrors?: () => Promise<void>;
   /**
    * Make the next N `listClips()` calls reject, standing in for the transient OPFS
    * exclusive-lock contention a reconnect can hit. Decremented on each failure.
@@ -61,6 +71,11 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
 
   return {
     init: async (): Promise<void> => {
+      if (opts.hangInit === true) {
+        await new Promise<never>(() => {
+          // never settles
+        });
+      }
       if (opts.failInit === true) {
         throw new Error("fake OPFS unavailable");
       }
@@ -70,6 +85,15 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
     writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
       if (opts.failWrites === true) {
         throw new Error("fake quota exceeded");
+      }
+      if (opts.quotaBytes != undefined) {
+        const used = Array.from(backing.clips.values()).reduce(
+          (total, entry) => total + entry.meta.byteSize,
+          0,
+        );
+        if (used + bytes.byteLength > opts.quotaBytes) {
+          throw new Error("fake quota exceeded");
+        }
       }
       backing.clips.set(meta.id, { meta, bytes: bytes.slice() });
     },
@@ -88,28 +112,33 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
     clearClips: async (): Promise<void> => {
       backing.clips.clear();
     },
-    writeMirror: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
+    writeMirror: async (meta: MirrorMeta, bytes: Uint8Array): Promise<void> => {
       backing.mirrors.set(instanceId, { meta, bytes: bytes.slice() });
     },
     listOrphanMirrors: async (): Promise<MirrorEntry[]> => {
       if (opts.failOrphanMirrors === true) {
         throw new Error("fake OPFS: mirror directory is locked");
       }
+      if (opts.beforeListOrphanMirrors != undefined) {
+        await opts.beforeListOrphanMirrors();
+      }
       const orphans: MirrorEntry[] = [];
       for (const [owner, entry] of backing.mirrors) {
         if (owner !== instanceId) {
-          orphans.push({ instanceId: owner, meta: entry.meta, bytes: entry.bytes.slice() });
+          orphans.push({ instanceId: owner, meta: entry.meta });
         }
       }
       return orphans;
     },
-    clearMirror: async (target?: string): Promise<void> => {
-      const id = target ?? instanceId;
-      if (opts.lockedMirrors?.has(id) === true) {
-        throw new Error(`fake OPFS: ${id} mirror is locked by its owner`);
-      }
-      backing.mirrors.delete(id);
+    readMirror: async (target: string): Promise<Uint8Array | undefined> => {
+      opts.onReadMirror?.(target);
+      return backing.mirrors.get(target)?.bytes.slice();
     },
+    // Real OPFS only locks a file for the instant a write is in flight, so deleting a live
+    // sibling's mirror nearly always succeeds. Modelling it as always-deletable is the point:
+    // liveness has to come from the heartbeat, not from whether this call worked.
+    clearMirror: async (target?: string): Promise<boolean> =>
+      backing.mirrors.delete(target ?? instanceId),
   };
 }
 
@@ -201,8 +230,13 @@ export function nanosOf(sec: number, nsec = 0): bigint {
   return BigInt(sec) * 1_000_000_000n + BigInt(nsec);
 }
 
-/** A minimal un-sealed mirror record, for seeding a "dead worker" into the backing. */
-export function makeMirrorMeta(overrides: Partial<ClipMeta> = {}): ClipMeta {
+/**
+ * A minimal un-sealed mirror record, for seeding another worker's mirror into the backing.
+ *
+ * `updatedAt` defaults to 0, i.e. long stale, which is the "dead worker" case. Pass a recent
+ * value to model a worker that is still running.
+ */
+export function makeMirrorMeta(overrides: Partial<MirrorMeta> = {}): MirrorMeta {
   return {
     id: "mirror",
     trigger: "recovered",
@@ -215,6 +249,7 @@ export function makeMirrorMeta(overrides: Partial<ClipMeta> = {}): ClipMeta {
     topicCounts: { "/a": 2, "/b": 1 },
     createdAt: 1_699_999_000_000,
     sealed: false,
+    updatedAt: 0,
     ...overrides,
   };
 }

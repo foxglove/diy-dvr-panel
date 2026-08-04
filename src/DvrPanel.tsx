@@ -92,8 +92,12 @@ type ConfirmTarget =
   | { kind: "clip"; id: string }
   | { kind: "all" }
   | { kind: "reset" }
-  /** A settled cache limit that cannot be applied without dropping cached clips. */
-  | { kind: "cacheLimit"; maxCacheMb: number; dropCount: number; dropBytes: number };
+  /**
+   * A settled cache limit that cannot be applied without dropping cached clips. Only the limit
+   * is held: how much it would cost is derived at render time from the current clip list, so
+   * clips arriving between the prompt and Apply cannot make the number a lie.
+   */
+  | { kind: "cacheLimit"; maxCacheMb: number };
 
 /**
  * The settings editor's number fields report every keystroke, so typing `2048` arrives as 2,
@@ -405,6 +409,8 @@ type OutboundMessage =
       channels: number;
       rotation?: boolean;
     }
+  /** Sent once the worker has wired itself up, so readiness is observed rather than assumed. */
+  | { type: "ready" }
   /** The full cached-clip list, re-broadcast after every create / evict / delete / clear. */
   | { type: "clips"; clips: ClipMeta[]; cache?: CacheStatus }
   /** One cached clip's bytes, in response to a requestClipBytes. */
@@ -553,12 +559,17 @@ function formatClock(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString();
 }
 
-/** Where cached clips live, in words that mean something to whoever is reading them. */
+/**
+ * Where cached clips live, in words that mean something to whoever is reading them.
+ *
+ * Not "stored on this device", which implies a file they could go and open — OPFS is the app's
+ * private sandbox, and Save to disk is the only way out of it.
+ */
 function cacheLocationLabel(cache: CacheStatus): string {
   if (!cache.available || cache.mode === "unavailable") {
     return "browser storage unavailable";
   }
-  return "stored on this device";
+  return "in-app cache";
 }
 
 /**
@@ -569,15 +580,16 @@ function cacheLocationLabel(cache: CacheStatus): string {
  * front of a user.
  */
 function cacheModeTooltip(cache: CacheStatus): string {
+  const answer = "Kept in the app's private storage — use Save to disk to export a clip as a file.";
   switch (cache.mode) {
     case "sync":
-      return "Local storage: OPFS sync access handles";
+      return `${answer} (OPFS sync access handles)`;
     case "async":
-      return "Local storage: OPFS async access";
+      return `${answer} (OPFS async access)`;
     case "unavailable":
-      return "Local storage: OPFS unavailable";
+      return "The app's private storage is unavailable here, so clips cannot be cached.";
     default:
-      return "Local storage: OPFS, access path not yet determined";
+      return `${answer} (OPFS, access path not yet determined)`;
   }
 }
 
@@ -890,6 +902,8 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const [forwarded, setForwarded] = useState(0);
   const [stat, setStat] = useState<WorkerStat>(ZERO_STAT);
   const [workerReady, setWorkerReady] = useState(false);
+  /** Set when the worker could not be created or died, which is otherwise invisible. */
+  const [workerError, setWorkerError] = useState<string | undefined>(undefined);
   const [config, setConfig] = useState<DvrConfig>(() => ({
     ...DEFAULT_CONFIG,
     ...(context.initialState as Partial<DvrConfig> | undefined),
@@ -1015,9 +1029,21 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
 
   // Spin up the worker once from a Blob URL (source bundled as a string).
   useEffect(() => {
-    const blob = new Blob([MCAP_WORKER_SOURCE], { type: "application/javascript" });
-    const url = URL.createObjectURL(blob);
-    const worker = new Worker(url);
+    let worker: Worker;
+    let url: string;
+    try {
+      const blob = new Blob([MCAP_WORKER_SOURCE], { type: "application/javascript" });
+      url = URL.createObjectURL(blob);
+      worker = new Worker(url);
+    } catch (err) {
+      // A host whose CSP forbids `blob:` in `worker-src` throws here. Without this the panel
+      // sat on "Starting…" for good, with the reason only in the devtools console.
+      console.error("[diy-dvr] could not start the capture worker", err);
+      setWorkerError(
+        `Capture could not start: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
     worker.onmessage = (event: MessageEvent) => {
       const data = event.data as OutboundMessage;
       switch (data.type) {
@@ -1088,6 +1114,11 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
             });
           break;
         }
+        case "ready":
+          // Readiness is the worker's word, not an assumption. Setting it at construction
+          // reported "Ready" even when the worker threw before running a line.
+          setWorkerReady(true);
+          break;
         case "error":
           console.error("[diy-dvr] worker save failed", data.message);
           setLastSave({ text: data.message, severity: "error" });
@@ -1099,13 +1130,18 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     };
     worker.onerror = (err) => {
       console.error("[diy-dvr] worker error", err);
+      setWorkerError(
+        err.message.length > 0
+          ? `Capture worker failed: ${err.message}`
+          : "Capture worker failed to start",
+      );
     };
     workerRef.current = worker;
-    setWorkerReady(true);
     return () => {
       worker.terminate();
       URL.revokeObjectURL(url);
       workerRef.current = undefined;
+      setWorkerReady(false);
     };
   }, []);
 
@@ -1254,12 +1290,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       if (pending.maxCacheMb !== settled.maxCacheMb && doomed.length > 0) {
         // Apply the harmless numbers now and hold the cache limit for confirmation.
         setSettled({ ...pending, maxCacheMb: settled.maxCacheMb });
-        setConfirming({
-          kind: "cacheLimit",
-          maxCacheMb: pending.maxCacheMb,
-          dropCount: doomed.length,
-          dropBytes: doomed.reduce((total, clip) => total + clip.byteSize, 0),
-        });
+        setConfirming({ kind: "cacheLimit", maxCacheMb: pending.maxCacheMb });
         return;
       }
       setSettled(pending);
@@ -1471,13 +1502,37 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   const saveDestination = saveFolderName ?? "Browser download";
   const theme = makeTheme(colorScheme);
   const clipsLoaded = clips != undefined;
-  const loadedClips = clips ?? [];
+  const loadedClips = useMemo(() => clips ?? [], [clips]);
   const cacheBytes = loadedClips.reduce((total, clip) => total + clip.byteSize, 0);
   // Newest first on screen; "Save all" still writes chronologically.
   const clipsNewestFirst = [...loadedClips].reverse();
   const hasClips = loadedClips.length > 0;
 
   const hasBuffer = stat.bufferedMsgs > 0;
+  // Derived, not remembered: clips can arrive between the prompt and Apply, so the number the
+  // user is shown is always the one Apply will act on.
+  const pendingCapCost = useMemo(() => {
+    if (confirming?.kind !== "cacheLimit") {
+      return undefined;
+    }
+    const doomed = planEviction(loadedClips, mbToBytes(confirming.maxCacheMb));
+    if (doomed.length === 0) {
+      return undefined; // nothing left to lose; nothing to confirm
+    }
+    return {
+      count: doomed.length,
+      bytes: doomed.reduce((total, clip) => total + clip.byteSize, 0),
+    };
+  }, [confirming, loadedClips]);
+
+  // A pending limit whose cost has since disappeared (the clips were deleted, or another
+  // change evicted them) has nothing left to warn about, so stop holding it.
+  useEffect(() => {
+    if (confirming?.kind === "cacheLimit" && pendingCapCost == undefined) {
+      onApplyCacheLimit(confirming.maxCacheMb);
+    }
+  }, [confirming, pendingCapCost, onApplyCacheLimit]);
+
   const cachingClip = busy.has(BUSY_CACHE_CLIP);
   const savingAll = busy.has(BUSY_SAVE_ALL);
   const status = bufferStatus(stat, { workerReady, enabledTopics: enabledTopics.length });
@@ -1629,6 +1684,12 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         {/* A paused or denied save means data is not reaching the folder. That is far too
             easy to miss in a muted stat row, so it stays pinned and coloured until either
             the next successful save replaces it or the user dismisses it. */}
+        {workerError != undefined && (
+          <Banner color={theme.danger} role="alert">
+            <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>{workerError}</span>
+          </Banner>
+        )}
+
         {alert != undefined && (
           <Banner color={alert.color} role="alert">
             <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>{alert.text}</span>
@@ -1649,11 +1710,11 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         {/* Lowering the cache limit past what is already cached would evict clips, so it is
             held here until the user agrees. The number field itself lives in the app's
             settings editor, which the panel cannot render into. */}
-        {confirming?.kind === "cacheLimit" && (
+        {confirming?.kind === "cacheLimit" && pendingCapCost != undefined && (
           <Banner color={theme.warn}>
             <span style={{ flex: "1 1 auto", wordBreak: "break-word" }}>
-              A {confirming.maxCacheMb} MB cache limit will drop {confirming.dropCount} cached clip
-              {confirming.dropCount === 1 ? "" : "s"} ({formatBytes(confirming.dropBytes)}). Apply?
+              A {confirming.maxCacheMb} MB cache limit will drop {pendingCapCost.count} cached clip
+              {pendingCapCost.count === 1 ? "" : "s"} ({formatBytes(pendingCapCost.bytes)}). Apply?
             </span>
             <ThemedButton
               theme={theme}

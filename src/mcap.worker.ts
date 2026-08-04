@@ -65,6 +65,11 @@ setInterval(() => {
   engine.tick();
 }, TICK_INTERVAL_MS);
 
+// Announce readiness only once everything above is wired. The panel used to assume the worker
+// was ready the moment it was constructed, so a throw at module scope here — a CSP that blocks
+// the blob, a missing API — left the panel reporting "Ready" while nothing ever arrived.
+ctx.postMessage({ type: "ready" });
+
 ctx.onmessage = (event) => {
   const data = event.data;
   switch (data.type) {
