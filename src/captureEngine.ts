@@ -573,8 +573,10 @@ export class CaptureEngine {
     spec: { trigger: ClipTrigger; triggerLabel: string; sealed: boolean },
   ): ClipMeta {
     const topicCounts: Record<string, number> = {};
+    const topicBytes: Record<string, number> = {};
     for (const record of snapshot) {
       topicCounts[record.topic] = (topicCounts[record.topic] ?? 0) + 1;
+      topicBytes[record.topic] = (topicBytes[record.topic] ?? 0) + record.data.byteLength;
     }
     const startNanos = snapshot[0]?.logTime ?? 0n;
     const endNanos = snapshot[snapshot.length - 1]?.logTime ?? 0n;
@@ -589,6 +591,7 @@ export class CaptureEngine {
       byteSize,
       messageCount: snapshot.length,
       topicCounts,
+      topicBytes,
       createdAt: this.#now(),
       sealed: spec.sealed,
     };

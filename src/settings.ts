@@ -11,14 +11,41 @@ import {
   SettingsTreeField,
   SettingsTreeFields,
   SettingsTreeNode,
+  SettingsTreeNodeAction,
   Topic,
 } from "@foxglove/extension";
 
 export type BudgetMode = "time" | "bytes";
 
+/**
+ * Topics under this prefix come from the app's user scripts rather than the data source.
+ *
+ * `Topic` carries no flag distinguishing the two, so the namespace is the signal. They are
+ * excluded from capture by default: a script that republishes an accumulating history keeps a
+ * flat message count while its payload grows without bound, which quietly inflates every clip.
+ */
+export const GENERATED_TOPIC_PREFIX = "/studio_script/";
+
+export function isGeneratedTopic(name: string): boolean {
+  return name.startsWith(GENERATED_TOPIC_PREFIX);
+}
+
+/** Whether a topic is captured, given the two opposite defaults. */
+export function isTopicEnabled(config: DvrConfig, name: string): boolean {
+  if (isGeneratedTopic(name)) {
+    return config.enabledGeneratedTopics.includes(name);
+  }
+  return !config.disabledTopics.includes(name);
+}
+
 export type DvrConfig = {
-  /** Allowlist is "all advertised topics minus these" — every topic defaults on. */
+  /** Source topics: "all advertised topics minus these" — every source topic defaults on. */
   disabledTopics: string[];
+  /**
+   * Generated topics: the opposite default. Only the ones listed here are captured, so a
+   * newly-appearing generated topic stays off until the user asks for it.
+   */
+  enabledGeneratedTopics: string[];
   budgetMode: BudgetMode;
   /** Seconds when mode === "time" (default 60); MB when mode === "bytes". */
   budgetValue: number;
@@ -34,6 +61,7 @@ export type DvrConfig = {
 
 export const DEFAULT_CONFIG: DvrConfig = {
   disabledTopics: [],
+  enabledGeneratedTopics: [],
   budgetMode: "time",
   budgetValue: 60,
   autoSave: false,
@@ -60,10 +88,26 @@ function buildTopicsFields(config: DvrConfig, topics: readonly Topic[]): Setting
     fields[topic.name] = {
       label: topic.name,
       input: "boolean",
-      value: !config.disabledTopics.includes(topic.name),
+      value: isTopicEnabled(config, topic.name),
     };
   }
   return fields;
+}
+
+/** Enable-all / disable-all for a whole topic group, in the node's overflow menu. */
+const TOPIC_GROUP_ACTIONS: SettingsTreeNodeAction[] = [
+  { type: "action", id: "all-on", label: "Enable all", display: "menu" },
+  { type: "action", id: "all-off", label: "Disable all", display: "menu" },
+];
+
+function splitTopics(topics: readonly Topic[]): {
+  source: readonly Topic[];
+  generated: readonly Topic[];
+} {
+  return {
+    source: topics.filter((topic) => !isGeneratedTopic(topic.name)),
+    generated: topics.filter((topic) => isGeneratedTopic(topic.name)),
+  };
 }
 
 export function buildSettingsTree(
@@ -179,10 +223,28 @@ export function buildSettingsTree(
       "storage on its own.",
   };
 
+  // Two groups rather than one flat list, because the two halves have opposite defaults and
+  // very different risk: a generated topic can grow without bound.
+  const { source, generated } = splitTopics(topics);
   const topicsNode: SettingsTreeNode = {
     label: "Topics",
     defaultExpansionState: "collapsed",
-    fields: buildTopicsFields(config, topics),
+    children: {
+      source: {
+        label: "Source",
+        actions: TOPIC_GROUP_ACTIONS,
+        fields: buildTopicsFields(config, source),
+      },
+      generated: {
+        label: "Generated",
+        actions: TOPIC_GROUP_ACTIONS,
+        help:
+          "Topics produced by user scripts. Off by default: a script that republishes a " +
+          "growing history keeps a flat message count while its payload keeps expanding, " +
+          "which inflates every clip.",
+        fields: buildTopicsFields(config, generated),
+      },
+    },
   };
 
   return {
@@ -212,13 +274,95 @@ function numericUpdate(value: unknown, current: number): number | undefined {
   return next;
 }
 
+/** Turn one topic on or off, honouring which list governs its group. */
+function setTopicEnabled(config: DvrConfig, name: string, state: "on" | "off"): DvrConfig {
+  const enabled = state === "on";
+  if (isTopicEnabled(config, name) === enabled) {
+    return config;
+  }
+  if (isGeneratedTopic(name)) {
+    // Governed by an allowlist, so enabling adds and disabling removes.
+    return {
+      ...config,
+      enabledGeneratedTopics: enabled
+        ? [...config.enabledGeneratedTopics, name]
+        : config.enabledGeneratedTopics.filter((topic) => topic !== name),
+    };
+  }
+  return {
+    ...config,
+    disabledTopics: enabled
+      ? config.disabledTopics.filter((topic) => topic !== name)
+      : [...config.disabledTopics, name],
+  };
+}
+
+/**
+ * Add or remove `names` from `list`, or `undefined` when the membership already matches.
+ *
+ * Only currently-advertised topics are passed in, so a topic the user switched off while it
+ * was present keeps that choice while it is absent from the source.
+ */
+function updateMembership(
+  list: readonly string[],
+  names: readonly string[],
+  operation: "add" | "remove",
+): string[] | undefined {
+  const next = new Set(list);
+  const before = next.size;
+  for (const name of names) {
+    if (operation === "add") {
+      next.add(name);
+    } else {
+      next.delete(name);
+    }
+  }
+  return next.size === before ? undefined : Array.from(next);
+}
+
+/** The "Enable all" / "Disable all" items in a topic group's overflow menu. */
+function applyNodeAction(
+  config: DvrConfig,
+  payload: { id: string; path: readonly string[] },
+  topics: readonly Topic[],
+): DvrConfig {
+  if (payload.path[0] !== "topics") {
+    return config;
+  }
+  const group = payload.path[1];
+  if (payload.id !== "all-on" && payload.id !== "all-off") {
+    return config;
+  }
+  const enable = payload.id === "all-on";
+  const { source, generated } = splitTopics(topics);
+
+  if (group === "generated") {
+    const names = generated.map((topic) => topic.name);
+    const next = updateMembership(config.enabledGeneratedTopics, names, enable ? "add" : "remove");
+    return next == undefined ? config : { ...config, enabledGeneratedTopics: next };
+  }
+  if (group === "source") {
+    const names = source.map((topic) => topic.name);
+    const next = updateMembership(config.disabledTopics, names, enable ? "remove" : "add");
+    return next == undefined ? config : { ...config, disabledTopics: next };
+  }
+  return config;
+}
+
 /**
  * Apply a settings-editor action to a config, returning a new config object.
  * Returns the *same* reference when nothing changes so callers can cheaply skip
  * re-renders / persistence. Ignores non-`update` actions (button clicks and
  * reorder-children are handled by the panel, not here).
  */
-export function applyAction(config: DvrConfig, action: SettingsTreeAction): DvrConfig {
+export function applyAction(
+  config: DvrConfig,
+  action: SettingsTreeAction,
+  topics: readonly Topic[] = [],
+): DvrConfig {
+  if (action.action === "perform-node-action") {
+    return applyNodeAction(config, action.payload, topics);
+  }
   if (action.action !== "update") {
     return config;
   }
@@ -272,20 +416,13 @@ export function applyAction(config: DvrConfig, action: SettingsTreeAction): DvrC
     return config;
   }
 
-  if (path[0] === "topics" && path.length >= 2) {
-    const name = path[1];
+  // ["topics", "source" | "generated", <topic name>]
+  if (path[0] === "topics" && path.length >= 3) {
+    const name = path[2];
     if (name == undefined) {
       return config;
     }
-    const disabled = value === false;
-    const isDisabled = config.disabledTopics.includes(name);
-    if (disabled === isDisabled) {
-      return config;
-    }
-    if (disabled) {
-      return { ...config, disabledTopics: [...config.disabledTopics, name] };
-    }
-    return { ...config, disabledTopics: config.disabledTopics.filter((t) => t !== name) };
+    return setTopicEnabled(config, name, value === false ? "off" : "on");
   }
 
   return config;

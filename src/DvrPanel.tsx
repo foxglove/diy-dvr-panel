@@ -6,7 +6,14 @@ import { createRoot } from "react-dom/client";
 import { ClipMeta, planEviction } from "./clipTypes";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { SaveResult, SaveStatus, statusFromResult } from "./saveStatus";
-import { applyAction, BudgetMode, buildSettingsTree, DEFAULT_CONFIG, DvrConfig } from "./settings";
+import {
+  applyAction,
+  BudgetMode,
+  buildSettingsTree,
+  DEFAULT_CONFIG,
+  DvrConfig,
+  isTopicEnabled,
+} from "./settings";
 
 // Extensions render plain React with no access to the app's MUI theme, so we drive
 // body colors from the watched color scheme with a small inline-style palette.
@@ -726,7 +733,16 @@ function ClipRow({
   onConfirmDelete,
   onCancelDelete,
 }: ClipRowProps): React.JSX.Element {
-  const topicCounts = Object.entries(clip.topicCounts).sort((a, b) => a[0].localeCompare(b[0]));
+  // Biggest contributor first: the point of showing bytes is to identify the topic behind a
+  // clip that grew unexpectedly. Clips cached before `topicBytes` existed sort by name.
+  const topicRows = Object.entries(clip.topicCounts)
+    .map(([topic, count]) => ({ topic, count, bytes: clip.topicBytes?.[topic] }))
+    .sort((a, b) => {
+      if (a.bytes !== b.bytes) {
+        return (b.bytes ?? 0) - (a.bytes ?? 0);
+      }
+      return a.topic.localeCompare(b.topic);
+    });
   // Two lines rather than one wide row: a panel is often only a few hundred pixels wide,
   // and five columns plus two controls on one line squeezes every label.
   return (
@@ -800,16 +816,19 @@ function ClipRow({
             fontSize: "0.75rem",
           }}
         >
-          {topicCounts.length === 0 ? (
+          {topicRows.length === 0 ? (
             <span style={{ color: theme.muted }}>No topics recorded.</span>
           ) : (
-            topicCounts.map(([topic, count]) => (
+            topicRows.map((row) => (
               <div
-                key={topic}
+                key={row.topic}
                 style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem" }}
               >
-                <span style={{ color: theme.muted, wordBreak: "break-all" }}>{topic}</span>
-                <span>{count}</span>
+                <span style={{ color: theme.muted, wordBreak: "break-all" }}>{row.topic}</span>
+                <span style={{ whiteSpace: "nowrap" }}>
+                  {row.count} msgs
+                  {row.bytes != undefined ? ` · ${formatBytes(row.bytes)}` : ""}
+                </span>
               </div>
             ))
           )}
@@ -977,9 +996,10 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
     };
   }, []);
 
+  // Source topics default on, generated ones default off — see isTopicEnabled.
   const enabledTopics = useMemo(
-    () => topics.filter((topic) => !config.disabledTopics.includes(topic.name)),
-    [topics, config.disabledTopics],
+    () => topics.filter((topic) => isTopicEnabled(config, topic.name)),
+    [topics, config],
   );
 
   // Spin up the worker once from a Blob URL (source bundled as a string).
@@ -1289,7 +1309,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
               });
               return; // don't enable without a live grant
             }
-            const next = applyAction(configRef.current, action);
+            const next = applyAction(configRef.current, action, topicsRef.current);
             if (next === configRef.current) {
               return;
             }
@@ -1300,7 +1320,7 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
         }
       }
 
-      const next = applyAction(configRef.current, action);
+      const next = applyAction(configRef.current, action, topicsRef.current);
       if (next === configRef.current) {
         return; // unchanged
       }

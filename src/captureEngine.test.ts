@@ -2,6 +2,7 @@
 // an injected store, clock, output sink, and MCAP framer, so everything below is plain
 // TypeScript running in Node.
 
+import { buildMcap, DvrRecord } from "./buildMcap";
 import { CaptureEngine, EngineConfig, FrameFn } from "./captureEngine";
 import { ClipMeta } from "./clipTypes";
 import { ClipStore } from "./opfsStore";
@@ -906,5 +907,140 @@ describe("graceful degradation", () => {
     engine.createClip("manual-clip");
     await engine.whenIdle();
     expect(backing.clips.size).toBe(1);
+  });
+});
+
+describe("capture is deterministic (a clip cannot inflate a fixed input)", () => {
+  /** Framer that records the exact snapshots it is handed, and frames them for real. */
+  function recordingFramer(): { frame: FrameFn; snapshots: Array<readonly DvrRecord[]> } {
+    const snapshots: Array<readonly DvrRecord[]> = [];
+    return {
+      snapshots,
+      frame: async (records, schemas) => {
+        snapshots.push(records);
+        return await buildMcap(records, schemas);
+      },
+    };
+  }
+
+  it("frames byte-identical clips from the same records", async () => {
+    // The scare this guards against: a clip that grew while message count and duration stayed
+    // flat. If the same input ever produces different output, this fails loudly.
+    const backing = createFakeBacking();
+    const framer = recordingFramer();
+    const { engine } = harness({ backing, frame: framer.frame });
+    engine.start();
+    engine.configure(config());
+    for (let sec = 100; sec < 110; sec++) {
+      engine.addMessage(makeMsg("/a", sec, { message: { value: sec, text: "x".repeat(sec) } }));
+      engine.addMessage(makeMsg("/b", sec));
+    }
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+
+    const clips = Array.from(backing.clips.values());
+    expect(clips).toHaveLength(2);
+    expect(clips[0]?.bytes).toEqual(clips[1]?.bytes);
+    expect(clips[0]?.meta.byteSize).toBe(clips[1]?.meta.byteSize);
+  });
+
+  it("encodes each message once and reuses that buffer for every clip", async () => {
+    // Re-encoding per clip would be where silent growth could creep in, so assert the very
+    // same buffer object is handed to both frames.
+    const framer = recordingFramer();
+    const { engine } = harness({ frame: framer.frame });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100));
+    engine.addMessage(makeMsg("/a", 101));
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    engine.createClip("backgrounded");
+    await engine.whenIdle();
+
+    expect(framer.snapshots).toHaveLength(2);
+    const [first, second] = framer.snapshots;
+    expect(first).toHaveLength(2);
+    expect(second).toHaveLength(2);
+    for (let i = 0; i < 2; i++) {
+      expect(second?.[i]?.data).toBe(first?.[i]?.data);
+    }
+  });
+
+  it("grows only in step with the source: a swelling payload inflates clips, a fixed one does not", async () => {
+    // This is the documented explanation for the original report — a user-script topic that
+    // republishes an ever-longer trail. Capture is faithful; the topic is the one growing.
+    const backing = createFakeBacking();
+    const { engine } = harness({ backing, frame: buildMcap });
+    engine.start();
+    engine.configure(config());
+
+    const measure = async (trigger: "manual-clip" | "backgrounded") => {
+      engine.createClip(trigger);
+      await engine.whenIdle();
+      const clips = storedClips(backing);
+      return clips[clips.length - 1];
+    };
+
+    // Same message count on both topics; only /grows has an expanding payload.
+    for (let i = 0; i < 20; i++) {
+      engine.addMessage(makeMsg("/fixed", 100 + i, { message: { trail: [1, 2, 3] } }));
+      engine.addMessage(
+        makeMsg("/grows", 100 + i, {
+          message: { trail: Array.from({ length: (i + 1) * 50 }, () => 1) },
+        }),
+      );
+    }
+    const meta = await measure("manual-clip");
+
+    expect(meta?.topicCounts).toEqual({ "/fixed": 20, "/grows": 20 });
+    const fixedBytes = meta?.topicBytes?.["/fixed"] ?? 0;
+    const growsBytes = meta?.topicBytes?.["/grows"] ?? 0;
+    expect(growsBytes).toBeGreaterThan(fixedBytes * 20);
+
+    // Duration and message count are flat across a second window, yet the clip is bigger,
+    // purely because the newer messages carry more data.
+    for (let i = 20; i < 40; i++) {
+      engine.addMessage(makeMsg("/fixed", 100 + i, { message: { trail: [1, 2, 3] } }));
+      engine.addMessage(
+        makeMsg("/grows", 100 + i, {
+          message: { trail: Array.from({ length: (i + 1) * 50 }, () => 1) },
+        }),
+      );
+    }
+    const later = await measure("backgrounded");
+    expect(later?.topicBytes?.["/fixed"]).toBeGreaterThan(fixedBytes);
+    expect(later?.topicBytes?.["/grows"]).toBeGreaterThan(growsBytes * 2);
+  });
+});
+
+describe("per-topic byte metadata", () => {
+  it("sums each topic's encoded payload", async () => {
+    const backing = createFakeBacking();
+    const { engine } = harness({ backing });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100, { message: { v: "aaaa" } }));
+    engine.addMessage(makeMsg("/a", 101, { message: { v: "bb" } }));
+    engine.addMessage(makeMsg("/b", 102, { message: { v: "cccccccc" } }));
+
+    // The engine's own view of the buffer is the reference for what the metadata should say.
+    const expected: Record<string, number> = {};
+    for (const record of engine.bufferedRecords()) {
+      expected[record.topic] = (expected[record.topic] ?? 0) + record.data.byteLength;
+    }
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+
+    const meta = storedClips(backing)[0];
+    expect(meta?.topicBytes).toEqual(expected);
+    expect(Object.values(meta?.topicBytes ?? {}).reduce((a, b) => a + b, 0)).toBe(
+      engine.stats().byteTotal,
+    );
   });
 });

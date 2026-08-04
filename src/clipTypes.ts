@@ -58,6 +58,15 @@ export type ClipMeta = {
   messageCount: number;
   /** Per-topic message counts within the clip. */
   topicCounts: Record<string, number>;
+  /**
+   * Per-topic encoded payload bytes within the clip. Optional because clips cached by an
+   * earlier build have no such field in their sidecar; those show counts only.
+   *
+   * This is what makes a runaway topic self-diagnosing. A user script that republishes a
+   * growing history (a breadcrumb trail, say) keeps its message *count* flat while its
+   * payload balloons, so counts alone cannot explain a clip that tripled in size.
+   */
+  topicBytes?: Record<string, number>;
   /** Wall-clock ms when the clip was captured. The FIFO ordering key. */
   createdAt: number;
   /** False only for the live mirror, which is still being updated. */
