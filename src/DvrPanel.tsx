@@ -553,20 +553,31 @@ function formatClock(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString();
 }
 
-/** Short description of where cached clips live, shown next to the clips heading. */
-function cacheModeLabel(cache: CacheStatus): string {
-  if (!cache.available) {
+/** Where cached clips live, in words that mean something to whoever is reading them. */
+function cacheLocationLabel(cache: CacheStatus): string {
+  if (!cache.available || cache.mode === "unavailable") {
     return "browser storage unavailable";
   }
+  return "stored on this device";
+}
+
+/**
+ * Which storage path the worker resolved, as a tooltip rather than visible text.
+ *
+ * It is how the sync-versus-async feature detection gets confirmed on a build — particularly
+ * on desktop, which cannot be exercised in CI — but it is jargon, so it does not belong in
+ * front of a user.
+ */
+function cacheModeTooltip(cache: CacheStatus): string {
   switch (cache.mode) {
     case "sync":
-      return "OPFS (sync)";
+      return "Local storage: OPFS sync access handles";
     case "async":
-      return "OPFS (async)";
+      return "Local storage: OPFS async access";
     case "unavailable":
-      return "browser storage unavailable";
+      return "Local storage: OPFS unavailable";
     default:
-      return "OPFS";
+      return "Local storage: OPFS, access path not yet determined";
   }
 }
 
@@ -1767,13 +1778,14 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       <CacheMeter theme={theme} usedBytes={cacheBytes} capBytes={capBytes} />
 
       <p
+        title={cacheModeTooltip(cache)}
         style={{
           margin: "0 0 0.35rem",
           color: theme.muted,
           fontSize: "0.75rem",
         }}
       >
-        {formatBytes(cacheBytes)} / {settled.maxCacheMb} MB · {cacheModeLabel(cache)}
+        {formatBytes(cacheBytes)} / {settled.maxCacheMb} MB · {cacheLocationLabel(cache)}
       </p>
 
       {hasClips ? (
