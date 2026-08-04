@@ -891,7 +891,8 @@ function statSummary(
     const spanNanos = BigInt(stat.newestNanos) - BigInt(stat.oldestNanos);
     // Floor at zero so a transient backward time jump can never render negative.
     const usedSec = stat.bufferedMsgs > 0 ? Math.max(0, Number(spanNanos) / 1e9) : 0;
-    return { used: `${usedSec.toFixed(1)}s`, cap: `${budget.value}s` };
+    // Whole seconds: tenths made the pinned readout visibly twitch on a busy stream.
+    return { used: `${Math.floor(usedSec)}s`, cap: `${budget.value}s` };
   }
   const usedMb = stat.byteTotal / (1024 * 1024);
   return { used: `${usedMb.toFixed(2)} MB`, cap: `${budget.value} MB` };

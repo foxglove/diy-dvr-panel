@@ -211,21 +211,38 @@ export function blockingFrame(): { frame: FrameFn; calls: () => number } {
   };
 }
 
-/** A message on `topic` whose publish time is `sec` seconds (plus `nsec`). */
+/**
+ * A message that *arrived* at `sec` seconds (plus `nsec`).
+ *
+ * `sec` sets `receiveTime`, which is what the ring keys its timeline on (MCAP's log_time). By
+ * default `publishTime` matches, as it does for a source with no clock skew; pass `publishSec`
+ * / `publishNsec` to separate the two and prove the source's own time is recorded independently
+ * of arrival order.
+ */
 export function makeMsg(
   topic: string,
   sec: number,
-  extra: { nsec?: number; message?: unknown } = {},
+  extra: {
+    nsec?: number;
+    message?: unknown;
+    publishSec?: number;
+    publishNsec?: number;
+  } = {},
 ): EngineInboundMsg {
+  const receiveTime = { sec, nsec: extra.nsec ?? 0 };
   return {
     topic,
     schemaName: topic,
-    publishTime: { sec, nsec: extra.nsec ?? 0 },
+    receiveTime,
+    publishTime:
+      extra.publishSec == undefined
+        ? receiveTime
+        : { sec: extra.publishSec, nsec: extra.publishNsec ?? 0 },
     message: extra.message ?? { value: sec },
   };
 }
 
-/** The nanosecond `logTime` a message built by {@link makeMsg} lands on. */
+/** The nanosecond receive/log time a message built by {@link makeMsg} lands on. */
 export function nanosOf(sec: number, nsec = 0): bigint {
   return BigInt(sec) * 1_000_000_000n + BigInt(nsec);
 }

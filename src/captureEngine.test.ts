@@ -2,6 +2,8 @@
 // an injected store, clock, output sink, and MCAP framer, so everything below is plain
 // TypeScript running in Node.
 
+import { McapIndexedReader } from "@mcap/core";
+
 import { buildMcap, DvrRecord } from "./buildMcap";
 import { CaptureEngine, EngineConfig, FrameFn } from "./captureEngine";
 import { ClipMeta } from "./clipTypes";
@@ -21,6 +23,29 @@ import {
   OutputCollector,
   sizedFrame,
 } from "./testFakes";
+
+/** Read a framed clip back the way the app would, to inspect its MCAP columns. */
+async function readMcapMessages(
+  bytes: Uint8Array,
+): Promise<Array<{ topic: string; logTime: bigint; publishTime: bigint }>> {
+  const reader = await McapIndexedReader.Initialize({
+    readable: {
+      size: async () => BigInt(bytes.byteLength),
+      read: async (offset: bigint, size: bigint) =>
+        bytes.subarray(Number(offset), Number(offset) + Number(size)),
+    },
+  });
+  const messages: Array<{ topic: string; logTime: bigint; publishTime: bigint }> = [];
+  // readMessages() yields in log-time order, which is the ordering playback defaults to.
+  for await (const message of reader.readMessages()) {
+    messages.push({
+      topic: reader.channelsById.get(message.channelId)?.topic ?? "(unknown)",
+      logTime: message.logTime,
+      publishTime: message.publishTime,
+    });
+  }
+  return messages;
+}
 
 /** Longer than any clock advance in these tests, so the mirror stays out of the way. */
 const NO_MIRROR = 1_000_000_000;
@@ -146,7 +171,7 @@ describe("live ring buffer", () => {
     expect(stats.newestNanos).toBe(nanosOf(109).toString());
   });
 
-  it("keeps records sorted when a source delivers times out of order", () => {
+  it("keeps records sorted even if arrival times themselves come out of order", () => {
     const { engine } = harness();
     engine.configure(config());
     engine.addMessage(makeMsg("/a", 100));
@@ -158,6 +183,62 @@ describe("live ring buffer", () => {
     const stats = engine.stats();
     expect(stats.oldestNanos).toBe(nanosOf(100).toString());
     expect(stats.newestNanos).toBe(nanosOf(102).toString());
+  });
+
+  it("windows on arrival time, not on scrambled publish times", async () => {
+    // A merged multi-sensor stream: every sensor has its own clock and its own latency, so
+    // publish times arrive out of order. Keying the window on them made its oldest and newest
+    // jump around — the reported span oscillated and the budget evicted in churn. Arrival order
+    // is the stable key, and it is what MCAP calls log_time.
+    const backing = createFakeBacking();
+    const { engine } = harness({ backing, frame: buildMcap });
+    engine.start();
+    engine.configure(config({ budgetNanos: 5n * 1_000_000_000n }));
+
+    // Arrival marches 100..109. Publish times are shuffled, and two sensors are badly skewed:
+    // one stamps 50 (a clock well behind the rest, arriving fourth) and one stamps 200 (a clock
+    // ahead). Keyed on publish time those two alone would drag the window across 150 s and
+    // evict nearly everything; keyed on arrival the window is simply the last 5 s.
+    const publishSeconds = [104, 101, 108, 50, 106, 103, 200, 102, 107, 105];
+    publishSeconds.forEach((publishSec, index) => {
+      engine.addMessage(makeMsg("/a", 100 + index, { publishSec }));
+    });
+
+    // (a) The window is ordered and bounded by arrival: exactly the last 5 s of it.
+    const kept = engine.bufferedRecords();
+    expect(kept.map((record) => record.logTime)).toEqual(
+      [104, 105, 106, 107, 108, 109].map((sec) => nanosOf(sec)),
+    );
+    const stats = engine.stats();
+    expect(BigInt(stats.newestNanos) - BigInt(stats.oldestNanos)).toBe(5n * 1_000_000_000n);
+    expect(stats.messageCount).toBe(10);
+
+    // (b) Each record still carries its own publish time, and the MCAP says so.
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    const stored = Array.from(backing.clips.values())[0];
+    expect(stored).toBeDefined();
+    const messages = await readMcapMessages(stored?.bytes ?? new Uint8Array());
+    expect(messages.map((message) => message.logTime)).toEqual(
+      [104, 105, 106, 107, 108, 109].map((sec) => nanosOf(sec)),
+    );
+    // Arrival 104..109 was published at 106, 103, 200, 102, 107, 105 respectively — including
+    // the skewed-ahead sensor, recorded faithfully rather than allowed to distort the window.
+    expect(messages.map((message) => message.publishTime)).toEqual(
+      [106, 103, 200, 102, 107, 105].map((sec) => nanosOf(sec)),
+    );
+  });
+
+  it("falls back to publish time when a message has no arrival time", () => {
+    // MCAP requires publish_time to fall back to log_time; here the only time available is the
+    // publish time, so it serves as both.
+    const { engine } = harness();
+    engine.configure(config());
+    engine.addMessage({ topic: "/a", publishTime: { sec: 7, nsec: 0 }, message: { v: 1 } });
+
+    const record = engine.bufferedRecords()[0];
+    expect(record?.logTime).toBe(nanosOf(7));
+    expect(record?.publishTime).toBe(nanosOf(7));
   });
 
   it("reports a stat on the tick when the buffer changed, and only then", () => {

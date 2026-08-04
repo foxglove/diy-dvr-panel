@@ -336,10 +336,21 @@ export class CaptureEngine {
       existing.schema = mergeJsonSchema(existing.schema, rootSchema(msg.message));
     }
 
-    // Key the buffered/saved timeline off the message's published time (the source's own
-    // clock) when present, falling back to receive/wall time. This keeps the ring and the
-    // saved MCAP consistent even when arrival order differs from publish order.
-    const logTime = toNanos(msg.publishTime ?? msg.receiveTime);
+    // Key the timeline off receive time — MCAP's log_time, which the app calls receive time —
+    // and not the source's publish time. Foxglove's guidance is to order on log time: publish
+    // times can arrive out of order, and on a merged multi-sensor stream each sensor has its
+    // own clock and latency, so a publish-time window's oldest and newest jump around. That
+    // made the reported span oscillate and the budget evict in churn instead of filling.
+    // https://docs.foxglove.dev/docs/visualization/playback#choosing-the-right-timestamp
+    //
+    // The record still carries the message's true publish time below, so the saved MCAP has a
+    // faithful publish_time column alongside log_time, and orders correctly on the default
+    // log-time timeline in playback. MCAP's rule that publish_time falls back to log_time is
+    // satisfied, since the fallback here *is* the log time.
+    //
+    // Arrival order is also near-monotonic, so `#insertRecord` takes its append fast path
+    // almost always rather than binary-searching an insert for every message.
+    const logTime = toNanos(msg.receiveTime ?? msg.publishTime);
     const data = this.#encodeMessage(msg.message);
     this.#insertRecord({
       topic: msg.topic,
@@ -351,10 +362,9 @@ export class CaptureEngine {
     this.#messageCount++;
 
     this.#enforceBudget();
-
-    if (this.#messageCount % 200 === 0) {
-      this.#postStat();
-    }
+    // No stat from here: 200 messages can land in a fraction of a second, which reported the
+    // buffer in uneven sub-second bursts and re-rendered the panel far more than a status with
+    // one-second granularity needs. `tick()` is the sole cadence for live-buffer stats.
   }
 
   /**
