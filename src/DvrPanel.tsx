@@ -3,12 +3,12 @@ import * as React from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { bufferStatus, statSummary } from "./bufferSummary";
 import { ClipMeta, planEviction } from "./clipTypes";
 import { MCAP_WORKER_SOURCE } from "./generatedWorkerSource";
 import { SaveResult, SaveStatus, statusFromResult } from "./saveStatus";
 import {
   applyAction,
-  BudgetMode,
   buildSettingsTree,
   DEFAULT_CONFIG,
   DvrConfig,
@@ -859,43 +859,6 @@ function ClipRow({
       )}
     </div>
   );
-}
-
-/**
- * The pinned one-liner. Being subscribed to topics is not the same as receiving data, so
- * this does not claim to be recording until something is actually buffered — the headline
- * state has to be honest about a source that is connected but silent.
- */
-function bufferStatus(
-  stat: WorkerStat,
-  flags: { workerReady: boolean; enabledTopics: number },
-): { label: string; active: boolean } {
-  if (!flags.workerReady) {
-    return { label: "Starting…", active: false };
-  }
-  if (flags.enabledTopics === 0) {
-    return { label: "No topics selected", active: false };
-  }
-  if (stat.bufferedMsgs === 0) {
-    return { label: "Waiting for data", active: false };
-  }
-  return { label: "Recording", active: true };
-}
-
-/** `budget` is the lookback actually in force — the settled value, not a half-typed one. */
-function statSummary(
-  stat: WorkerStat,
-  budget: { mode: BudgetMode; value: number },
-): { used: string; cap: string } {
-  if (budget.mode === "time") {
-    const spanNanos = BigInt(stat.newestNanos) - BigInt(stat.oldestNanos);
-    // Floor at zero so a transient backward time jump can never render negative.
-    const usedSec = stat.bufferedMsgs > 0 ? Math.max(0, Number(spanNanos) / 1e9) : 0;
-    // Whole seconds: tenths made the pinned readout visibly twitch on a busy stream.
-    return { used: `${Math.floor(usedSec)}s`, cap: `${budget.value}s` };
-  }
-  const usedMb = stat.byteTotal / (1024 * 1024);
-  return { used: `${usedMb.toFixed(2)} MB`, cap: `${budget.value} MB` };
 }
 
 function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.Element {
