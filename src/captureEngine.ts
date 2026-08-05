@@ -24,7 +24,9 @@
 // All store access runs through one serialized queue (`#enqueue`), so there is a single
 // writer, no overlapping builds, and deterministic ordering for the tests.
 
-import { buildMcap, DvrRecord, DvrSchema } from "./buildMcap";
+import { IWritable } from "@mcap/core";
+
+import { DvrRecord, DvrSchema, frameInto, MemoryWritable } from "./buildMcap";
 import { ClipMeta, ClipTrigger, PanelTrigger, planEviction } from "./clipTypes";
 import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
 import { ClipStore, ClipStoreMode } from "./opfsStore";
@@ -83,17 +85,24 @@ export type EngineOutput =
   | { type: "clipBytes"; id: string; meta: ClipMeta; buffer: ArrayBuffer }
   | { type: "error"; message: string };
 
+/**
+ * Writes the MCAP for `records` into `writable`.
+ *
+ * Streaming rather than returning bytes is deliberate: a cache write hands this straight to the
+ * file, so a multi-gigabyte ring never has a second full copy of itself in memory.
+ */
 export type FrameFn = (
+  writable: IWritable,
   records: readonly DvrRecord[],
   schemaByTopic: ReadonlyMap<string, DvrSchema>,
-) => Promise<Uint8Array>;
+) => Promise<void>;
 
 export type CaptureEngineDeps = {
   store: ClipStore;
   /** Wall-clock milliseconds. Injected so tests can drive time without real timers. */
   now: () => number;
   emit: (message: EngineOutput, transfer?: Transferable[]) => void;
-  /** MCAP framer. Defaults to `buildMcap`; tests inject a stub for exact byte sizes. */
+  /** MCAP framer. Defaults to `frameInto`; tests inject a stub for exact byte sizes. */
   frame?: FrameFn;
   mirrorIntervalMs?: number;
   /** Retry backoff. Injected so tests do not wait on real timers. */
@@ -168,6 +177,12 @@ export class CaptureEngine {
 
   // --- clip cache ---
   #clips: ClipMeta[] = [];
+  /**
+   * How large the last clip actually framed to. A window's encoded payloads under-state its
+   * framed size — the MCAP structure around them is fixed overhead that dominates for small
+   * windows — so the previous result is the better estimate when reserving room.
+   */
+  #lastClipBytes = 0;
   #cacheAvailable = true;
   #warnedUnavailable = false;
   #seq = 0;
@@ -193,7 +208,7 @@ export class CaptureEngine {
     this.#store = deps.store;
     this.#now = deps.now;
     this.#emit = deps.emit;
-    this.#frame = deps.frame ?? buildMcap;
+    this.#frame = deps.frame ?? frameInto;
     this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
     this.#initTimeoutMs = deps.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
     this.#delay =
@@ -389,7 +404,9 @@ export class CaptureEngine {
   /** Non-destructive: frame the current window and hand the bytes to the panel. */
   public save(): void {
     const schemas = this.#snapshotSchemaMap();
-    this.#frame(this.#records, schemas)
+    // Framed to a buffer, not streamed: this one exists to be handed to the panel, which writes
+    // it out through the File System Access API.
+    this.#frameToBytes(this.#records, schemas)
       .then((bytes) => {
         this.#emitBuffer(bytes, "manual");
       })
@@ -510,17 +527,17 @@ export class CaptureEngine {
       return;
     }
     this.#enqueueCacheOp(async () => {
-      const bytes = await this.#frame(snapshot, schemas);
-      const meta = this.#buildMeta(snapshot, bytes.byteLength, {
-        trigger,
-        triggerLabel: label,
-        sealed: true,
-      });
+      const meta = this.#buildMeta(snapshot, { trigger, triggerLabel: label, sealed: true });
       // Make room before writing rather than after. Evicting afterwards means a cache already
       // at its cap has to survive being briefly over it — and if the write fails for want of
-      // space, the eviction that would have freed some never runs.
-      await this.#evictToCap(bytes.byteLength);
-      await this.#store.writeClip(meta, bytes);
+      // space, the eviction that would have freed some never runs. The framed size is not known
+      // until the payload has streamed, so reserve against the encoded payloads it is made of;
+      // the second pass below enforces the cap exactly.
+      await this.#evictToCap(Math.max(payloadBytes(snapshot), this.#lastClipBytes));
+      const written = await this.#store.writeClip(meta, async (writable) => {
+        await this.#frame(writable, snapshot, schemas);
+      });
+      this.#lastClipBytes = written.byteSize;
       this.#clips = await this.#store.listClips();
       await this.#evictToCap();
       this.#broadcastClips();
@@ -573,7 +590,11 @@ export class CaptureEngine {
         createdAt: this.#now(),
         sealed: true,
       };
-      await this.#store.writeClip(meta, bytes);
+      // Recovery is a cold path that already holds the mirror's bytes, so it just replays them
+      // into the new clip rather than re-framing anything.
+      await this.#store.writeClip(meta, async (writable) => {
+        await writable.write(bytes);
+      });
       promoted++;
     }
     if (promoted > 0) {
@@ -660,9 +681,12 @@ export class CaptureEngine {
     return false;
   }
 
+  /**
+   * Everything about a clip except its size, which only the store knows once the payload has
+   * finished streaming into the file.
+   */
   #buildMeta(
     snapshot: readonly DvrRecord[],
-    byteSize: number,
     spec: { trigger: ClipTrigger; triggerLabel: string; sealed: boolean },
   ): ClipMeta {
     const topicCounts: Record<string, number> = {};
@@ -681,7 +705,7 @@ export class CaptureEngine {
       startNanos: startNanos.toString(),
       endNanos: endNanos.toString(),
       durationSec: spanNanos > 0n ? Number(spanNanos) / 1e9 : 0,
-      byteSize,
+      byteSize: 0, // filled in by the store, from what the framing actually wrote
       messageCount: snapshot.length,
       topicCounts,
       topicBytes,
@@ -773,14 +797,16 @@ export class CaptureEngine {
         if (!this.#cacheAvailable) {
           return;
         }
-        const bytes = await this.#frame(snapshot, schemas);
-        const meta = this.#buildMeta(snapshot, bytes.byteLength, {
+        const meta = this.#buildMeta(snapshot, {
           trigger: "recovered",
           triggerLabel: TRIGGER_LABELS.recovered,
           sealed: false,
         });
-        // The heartbeat is what tells another worker this mirror is still being tended.
-        await this.#store.writeMirror({ ...meta, updatedAt: this.#now() }, bytes);
+        // Streamed straight into the file: this is the write that used to allocate a second full
+        // copy of the ring every few seconds. The heartbeat tells another worker it is tended.
+        await this.#store.writeMirror({ ...meta, updatedAt: this.#now() }, async (writable) => {
+          await this.#frame(writable, snapshot, schemas);
+        });
         this.#mirroredMessageCount = mirroredCount;
       } finally {
         this.#mirrorInFlight = false;
@@ -889,13 +915,26 @@ export class CaptureEngine {
 
   /** Async-frame a rotated window and post it as a rotation "saved" event. */
   #flushRotation(snapshot: DvrRecord[], schemas: Map<string, DvrSchema>): void {
-    this.#frame(snapshot, schemas)
+    this.#frameToBytes(snapshot, schemas)
       .then((bytes) => {
         this.#emitBuffer(bytes, "rotation");
       })
       .catch((err: unknown) => {
         this.#emitError(err);
       });
+  }
+
+  /**
+   * Frame to a buffer, for the two paths that genuinely need the bytes in hand: the manual save
+   * and the auto-save rotation, both of which post them to the panel to write to disk.
+   */
+  async #frameToBytes(
+    records: readonly DvrRecord[],
+    schemas: ReadonlyMap<string, DvrSchema>,
+  ): Promise<Uint8Array> {
+    const writable = new MemoryWritable();
+    await this.#frame(writable, records, schemas);
+    return writable.toUint8Array();
   }
 
   /** Freeze the current per-topic schemas into the framing shape (name/encoding/data). */
@@ -994,6 +1033,11 @@ async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promi
       clearTimeout(timer);
     }
   }
+}
+
+/** Total encoded payload bytes in a snapshot: a close, cheap proxy for its framed size. */
+function payloadBytes(records: readonly DvrRecord[]): number {
+  return records.reduce((total, record) => total + record.data.byteLength, 0);
 }
 
 function toNanos(time?: Time): bigint {

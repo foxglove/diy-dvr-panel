@@ -8,9 +8,11 @@
 // clips the old one wrote, and sees the old view's mirror as an orphan, exactly as a
 // freshly-created worker sees what OPFS kept after the previous one was terminated.
 
+import { IWritable } from "@mcap/core";
+
 import { EngineInboundMsg, EngineOutput, FrameFn } from "./captureEngine";
 import { ClipMeta, MirrorMeta } from "./clipTypes";
-import { ClipStore, ClipStoreMode, MirrorEntry } from "./opfsStore";
+import { ClipStore, ClipStoreMode, FramePayload, MirrorEntry } from "./opfsStore";
 
 type StoredFile = { meta: ClipMeta; bytes: Uint8Array };
 type StoredMirror = { meta: MirrorMeta; bytes: Uint8Array };
@@ -24,6 +26,44 @@ export type FakeBacking = {
 
 export function createFakeBacking(): FakeBacking {
   return { clips: new Map(), mirrors: new Map() };
+}
+
+/**
+ * Collects the chunks a framer streams, standing in for the file the real store writes to.
+ *
+ * Also records the largest amount held at any one instant, which is what makes the streaming
+ * guarantee testable: a writable that forwards each chunk onward never holds more than one.
+ */
+export function collectingWritable(): {
+  writable: IWritable;
+  bytes: () => Uint8Array;
+  written: () => number;
+  maxChunkBytes: () => number;
+} {
+  const chunks: Uint8Array[] = [];
+  let written = 0;
+  let maxChunkBytes = 0;
+  return {
+    writable: {
+      write: async (chunk: Uint8Array) => {
+        chunks.push(chunk.slice());
+        written += chunk.byteLength;
+        maxChunkBytes = Math.max(maxChunkBytes, chunk.byteLength);
+      },
+      position: () => BigInt(written),
+    },
+    bytes: () => {
+      const out = new Uint8Array(written);
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return out;
+    },
+    written: () => written,
+    maxChunkBytes: () => maxChunkBytes,
+  };
 }
 
 export type FakeStoreOptions = {
@@ -82,10 +122,13 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
     },
     mode: (): ClipStoreMode => (opts.failInit === true ? "unavailable" : mode),
     instanceId: (): string => instanceId,
-    writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
+    writeClip: async (meta: ClipMeta, frame: FramePayload): Promise<ClipMeta> => {
       if (opts.failWrites === true) {
         throw new Error("fake quota exceeded");
       }
+      const sink = collectingWritable();
+      await frame(sink.writable);
+      const bytes = sink.bytes();
       if (opts.quotaBytes != undefined) {
         const used = Array.from(backing.clips.values()).reduce(
           (total, entry) => total + entry.meta.byteSize,
@@ -95,7 +138,10 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
           throw new Error("fake quota exceeded");
         }
       }
-      backing.clips.set(meta.id, { meta, bytes: bytes.slice() });
+      // The store owns the size, since only it sees what the framing produced.
+      const written: ClipMeta = { ...meta, byteSize: bytes.byteLength };
+      backing.clips.set(meta.id, { meta: written, bytes });
+      return written;
     },
     listClips: async (): Promise<ClipMeta[]> => {
       if (opts.failListClipsTimes != undefined && opts.failListClipsTimes > 0) {
@@ -112,8 +158,13 @@ export function createFakeClipStore(backing: FakeBacking, opts: FakeStoreOptions
     clearClips: async (): Promise<void> => {
       backing.clips.clear();
     },
-    writeMirror: async (meta: MirrorMeta, bytes: Uint8Array): Promise<void> => {
-      backing.mirrors.set(instanceId, { meta, bytes: bytes.slice() });
+    writeMirror: async (meta: MirrorMeta, frame: FramePayload): Promise<MirrorMeta> => {
+      const sink = collectingWritable();
+      await frame(sink.writable);
+      const bytes = sink.bytes();
+      const written: MirrorMeta = { ...meta, byteSize: bytes.byteLength };
+      backing.mirrors.set(instanceId, { meta: written, bytes });
+      return written;
     },
     listOrphanMirrors: async (): Promise<MirrorEntry[]> => {
       if (opts.failOrphanMirrors === true) {
@@ -192,9 +243,11 @@ export function collectOutputs(): OutputCollector {
   };
 }
 
-/** A framer producing a fixed byte count, so cache-eviction math is exact. */
+/** A framer writing a fixed byte count, so cache-eviction math is exact. */
 export function sizedFrame(byteSize: number): FrameFn {
-  return async () => new Uint8Array(byteSize);
+  return async (writable) => {
+    await writable.write(new Uint8Array(byteSize));
+  };
 }
 
 /** A framer that never settles, for testing the mirror's overlap guard. */
@@ -203,7 +256,7 @@ export function blockingFrame(): { frame: FrameFn; calls: () => number } {
   return {
     frame: async () => {
       calls++;
-      return await new Promise<Uint8Array>(() => {
+      await new Promise<void>(() => {
         // never resolves
       });
     },

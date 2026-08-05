@@ -4,12 +4,13 @@
 
 import { McapIndexedReader } from "@mcap/core";
 
-import { buildMcap, DvrRecord } from "./buildMcap";
+import { buildMcap, DvrRecord, frameInto } from "./buildMcap";
 import { CaptureEngine, EngineConfig, FrameFn } from "./captureEngine";
 import { ClipMeta } from "./clipTypes";
 import { ClipStore } from "./opfsStore";
 import {
   blockingFrame,
+  collectingWritable,
   collectOutputs,
   createFakeBacking,
   createFakeClipStore,
@@ -191,7 +192,7 @@ describe("live ring buffer", () => {
     // jump around — the reported span oscillated and the budget evicted in churn. Arrival order
     // is the stable key, and it is what MCAP calls log_time.
     const backing = createFakeBacking();
-    const { engine } = harness({ backing, frame: buildMcap });
+    const { engine } = harness({ backing, frame: frameInto });
     engine.start();
     engine.configure(config({ budgetNanos: 5n * 1_000_000_000n }));
 
@@ -1188,9 +1189,9 @@ describe("capture is deterministic (a clip cannot inflate a fixed input)", () =>
     const snapshots: Array<readonly DvrRecord[]> = [];
     return {
       snapshots,
-      frame: async (records, schemas) => {
+      frame: async (writable, records, schemas) => {
         snapshots.push(records);
-        return await buildMcap(records, schemas);
+        await frameInto(writable, records, schemas);
       },
     };
   }
@@ -1247,7 +1248,7 @@ describe("capture is deterministic (a clip cannot inflate a fixed input)", () =>
     // This is the documented explanation for the original report — a user-script topic that
     // republishes an ever-longer trail. Capture is faithful; the topic is the one growing.
     const backing = createFakeBacking();
-    const { engine } = harness({ backing, frame: buildMcap });
+    const { engine } = harness({ backing, frame: frameInto });
     engine.start();
     engine.configure(config());
 
@@ -1328,10 +1329,10 @@ describe("bounded mirror cost", () => {
       backing,
       clock,
       mirrorIntervalMs: 5000,
-      frame: async () => {
+      frame: async (writable) => {
         frames++;
         clock.advance(2000); // this mirror took two seconds
-        return new Uint8Array(64);
+        await writable.write(new Uint8Array(64));
       },
     });
     engine.start();
@@ -1362,9 +1363,9 @@ describe("bounded mirror cost", () => {
     const { engine } = harness({
       clock,
       mirrorIntervalMs: 5000,
-      frame: async () => {
+      frame: async (writable) => {
         frames++;
-        return new Uint8Array(64);
+        await writable.write(new Uint8Array(64));
       },
     });
     engine.start();
@@ -1446,5 +1447,94 @@ describe("64-bit integer fields", () => {
     // Beyond it, the exact digits are kept rather than a silently different number.
     expect(parsed.huge).toBe("9007199254740993");
     expect(encoded).not.toContain("9007199254740992");
+  });
+});
+
+describe("framing streams instead of buffering", () => {
+  /** A ring big enough that its MCAP spans many writer chunks (the default chunk is 1 MiB). */
+  function bigRing(messageCount: number, payloadBytes: number): DvrRecord[] {
+    const filler = "x".repeat(payloadBytes);
+    return Array.from({ length: messageCount }, (_unused, index) => ({
+      topic: index % 2 === 0 ? "/a" : "/b",
+      logTime: nanosOf(100 + index),
+      publishTime: nanosOf(100 + index),
+      data: new TextEncoder().encode(JSON.stringify({ index, filler })),
+    }));
+  }
+
+  const schemas = new Map([
+    ["/a", { name: "/a", encoding: "jsonschema", data: new TextEncoder().encode("{}") }],
+    ["/b", { name: "/b", encoding: "jsonschema", data: new TextEncoder().encode("{}") }],
+  ]);
+
+  it("produces exactly the same MCAP as framing to a buffer", async () => {
+    const records = bigRing(200, 4096);
+    const sink = collectingWritable();
+    await frameInto(sink.writable, records, schemas);
+
+    // Same bytes as the in-memory path, so nothing about the output depends on how it was
+    // written — and the read-back agrees on what is in it.
+    expect(sink.bytes()).toEqual(await buildMcap(records, schemas));
+    const messages = await readMcapMessages(sink.bytes());
+    expect(messages).toHaveLength(records.length);
+    expect(new Set(messages.map((message) => message.topic))).toEqual(new Set(["/a", "/b"]));
+    expect(messages.map((message) => message.logTime)).toEqual(
+      records.map((record) => record.logTime),
+    );
+  });
+
+  it("never holds more than one chunk, however big the ring", async () => {
+    // The point of the change: peak memory per frame is one writer chunk, not the whole MCAP.
+    // A writable that forwards each chunk onward therefore sees many modest writes rather than
+    // one enormous one — which is what a MemoryWritable would have accumulated.
+    const records = bigRing(3000, 4096); // ~12 MB of payload, many 1 MiB chunks
+    const sink = collectingWritable();
+    await frameInto(sink.writable, records, schemas);
+
+    const total = sink.written();
+    expect(total).toBeGreaterThan(8 * 1024 * 1024); // genuinely larger than one chunk
+    // A few MB covers the 1 MiB chunk plus its framing; nowhere near the whole file.
+    expect(sink.maxChunkBytes()).toBeLessThan(4 * 1024 * 1024);
+    expect(sink.maxChunkBytes()).toBeLessThan(total / 4);
+  });
+
+  it("streams a clip into the store rather than handing it finished bytes", async () => {
+    // End to end through the engine: the store is given a framer, and the size recorded in the
+    // metadata is whatever that framing actually wrote.
+    const backing = createFakeBacking();
+    const { engine } = harness({ backing, frame: frameInto });
+    engine.start();
+    engine.configure(config());
+    for (let sec = 100; sec < 110; sec++) {
+      engine.addMessage(makeMsg("/a", sec, { message: { filler: "y".repeat(2048) } }));
+    }
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+
+    const stored = Array.from(backing.clips.values())[0];
+    expect(stored).toBeDefined();
+    expect(stored?.meta.byteSize).toBe(stored?.bytes.byteLength);
+    expect(stored?.meta.byteSize).toBeGreaterThan(0);
+    // And it is a real, readable MCAP.
+    expect(await readMcapMessages(stored?.bytes ?? new Uint8Array())).toHaveLength(10);
+  });
+
+  it("streams the mirror too, and records what it wrote", async () => {
+    const backing = createFakeBacking();
+    const clock = createFakeClock();
+    const { engine } = harness({ backing, clock, frame: frameInto, mirrorIntervalMs: 5000 });
+    engine.start();
+    engine.configure(config());
+    engine.addMessage(makeMsg("/a", 100, { message: { filler: "z".repeat(4096) } }));
+    clock.advance(5000);
+    engine.tick();
+    await engine.whenIdle();
+
+    const mirror = backing.mirrors.get("instance-a");
+    expect(mirror?.meta.byteSize).toBe(mirror?.bytes.byteLength);
+    expect(mirror?.meta.sealed).toBe(false);
+    // The heartbeat still goes on after the payload.
+    expect(mirror?.meta.updatedAt).toBe(clock.now());
   });
 });

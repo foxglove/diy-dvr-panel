@@ -30,6 +30,8 @@
 // desktop builds, so both paths are implemented behind one API and the store reports
 // which one is live via `mode()`.
 
+import { IWritable } from "@mcap/core";
+
 import { ClipMeta, MirrorMeta } from "./clipTypes";
 
 const ROOT_DIR = "diy-dvr";
@@ -88,6 +90,15 @@ export type MirrorEntry = {
  * this interface, so the OPFS implementation and the in-memory test fake are
  * interchangeable and neither the engine nor the panel branches on which is active.
  */
+/**
+ * Writes a payload into the sink the store opened for it. Called once, while the file is open.
+ *
+ * Taking a framer rather than a finished `Uint8Array` is what keeps a multi-gigabyte capture out
+ * of memory: the MCAP streams into the file a chunk at a time instead of being built whole and
+ * then copied.
+ */
+export type FramePayload = (writable: IWritable) => Promise<void>;
+
 export type ClipStore = {
   /** Prepare the directories and resolve the access mode. Rejects when OPFS is unusable. */
   init: () => Promise<void>;
@@ -98,14 +109,15 @@ export type ClipStore = {
    * callers must fold this into any name they invent to stay collision-free.
    */
   instanceId: () => string;
-  writeClip: (meta: ClipMeta, bytes: Uint8Array) => Promise<void>;
+  /** Frame a clip into storage. Returns the metadata with the written size filled in. */
+  writeClip: (meta: ClipMeta, frame: FramePayload) => Promise<ClipMeta>;
   /** Cached clips, oldest first. Clips with a missing payload or sidecar are skipped. */
   listClips: () => Promise<ClipMeta[]>;
   readClip: (id: string) => Promise<Uint8Array | undefined>;
   deleteClip: (id: string) => Promise<void>;
   clearClips: () => Promise<void>;
   /** Overwrite this instance's mirror of the live ring buffer, heartbeat included. */
-  writeMirror: (meta: MirrorMeta, bytes: Uint8Array) => Promise<void>;
+  writeMirror: (meta: MirrorMeta, frame: FramePayload) => Promise<MirrorMeta>;
   /** Mirrors belonging to *other* worker instances. Liveness is judged by their heartbeat. */
   listOrphanMirrors: () => Promise<MirrorEntry[]>;
   /** The payload of one mirror, read only once it is worth promoting. */
@@ -189,30 +201,75 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
     name: string,
     bytes: Uint8Array,
   ): Promise<void> {
+    await streamFile(dir, name, async (writable) => {
+      await writable.write(bytes);
+    });
+  }
+
+  /**
+   * Open a file, hand it to `frame` as an {@link IWritable}, and close it. Returns how many
+   * bytes were written.
+   *
+   * Nothing full-size passes through memory here: each chunk the framer produces goes straight
+   * to the file. The handle is always closed, including when the framer throws.
+   */
+  async function streamFile(
+    dir: FileSystemDirectoryHandle,
+    name: string,
+    frame: FramePayload,
+  ): Promise<number> {
     const handle = await dir.getFileHandle(name, { create: true });
     const openSync = syncBroken
       ? undefined
       : (handle as SyncCapableFileHandle).createSyncAccessHandle;
     if (openSync != undefined) {
+      let sync: FileSystemSyncAccessHandle | undefined = undefined;
       try {
-        const sync = await openSync.call(handle);
-        try {
-          sync.truncate(0);
-          sync.write(bytes, { at: 0 });
-          sync.flush();
-        } finally {
-          sync.close();
-        }
-        mode = "sync";
-        return;
+        sync = await openSync.call(handle);
       } catch {
+        // Not usable here (or already held); fall back for good rather than retrying per write.
         syncBroken = true;
       }
+      if (sync != undefined) {
+        const openHandle = sync;
+        try {
+          openHandle.truncate(0);
+          let position = 0;
+          await frame({
+            write: async (chunk: Uint8Array) => {
+              // The sync handle writes synchronously; the interface is promise-shaped.
+              openHandle.write(chunk, { at: position });
+              position += chunk.byteLength;
+            },
+            position: () => BigInt(position),
+          });
+          openHandle.flush();
+          mode = "sync";
+          return position;
+        } finally {
+          openHandle.close();
+        }
+      }
     }
-    const writable = await handle.createWritable();
-    await writable.write(bytes);
-    await writable.close();
+    const stream = await handle.createWritable();
+    let position = 0;
+    try {
+      await frame({
+        // The browser streams this to scratch storage and swaps it in on close, so the finished
+        // file never sits in our heap either.
+        write: async (chunk: Uint8Array) => {
+          await stream.write(chunk);
+          position += chunk.byteLength;
+        },
+        position: () => BigInt(position),
+      });
+    } catch (err) {
+      await stream.abort().catch(() => undefined);
+      throw err;
+    }
+    await stream.close();
     mode = "async";
+    return position;
   }
 
   /** Read a whole file, or `undefined` when it does not exist. */
@@ -335,19 +392,22 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
 
     instanceId: (): string => ownId,
 
-    writeClip: async (meta: ClipMeta, bytes: Uint8Array): Promise<void> => {
+    writeClip: async (meta: ClipMeta, frame: FramePayload): Promise<ClipMeta> =>
       await withDirs(async ({ clips }) => {
-        await writeFile(clips, meta.id + CLIP_EXT, bytes);
+        // The size is whatever the framing actually produced, not something the caller had to
+        // know in advance — it cannot, when the payload is streamed.
+        const byteSize = await streamFile(clips, meta.id + CLIP_EXT, frame);
+        const written: ClipMeta = { ...meta, byteSize };
         try {
-          await writeFile(clips, meta.id + META_EXT, encodeMeta(meta));
+          await writeFile(clips, meta.id + META_EXT, encodeMeta(written));
         } catch (err) {
           // Without its sidecar the payload is invisible to listClips but still consumes the
           // quota, so a failure here (running out of room, most likely) must not leave it.
           await removeIfPresent(clips, meta.id + CLIP_EXT);
           throw err;
         }
-      });
-    },
+        return written;
+      }),
 
     listClips,
 
@@ -371,12 +431,14 @@ export function createOpfsStore(instanceId: string = randomInstanceId()): ClipSt
       await dirs();
     },
 
-    writeMirror: async (meta: MirrorMeta, bytes: Uint8Array): Promise<void> => {
+    writeMirror: async (meta: MirrorMeta, frame: FramePayload): Promise<MirrorMeta> =>
       await withDirs(async ({ mirror }) => {
-        await writeFile(mirror, ownId + MIRROR_EXT, bytes);
-        await writeFile(mirror, ownId + META_EXT, encodeMeta(meta));
-      });
-    },
+        const byteSize = await streamFile(mirror, ownId + MIRROR_EXT, frame);
+        const written: MirrorMeta = { ...meta, byteSize };
+        // Sidecar last, as ever: it is both the commit marker and the liveness heartbeat.
+        await writeFile(mirror, ownId + META_EXT, encodeMeta(written));
+        return written;
+      }),
 
     listOrphanMirrors: async (): Promise<MirrorEntry[]> =>
       await withDirs(async ({ mirror }) => {
