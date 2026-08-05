@@ -10,6 +10,7 @@ import { BudgetMode } from "./settings";
 export type BufferStat = {
   bufferedMsgs: number;
   byteTotal: number;
+  /** Arrival times, so the reported span stays meaningful on a looping or replayed source. */
   oldestNanos: string;
   newestNanos: string;
 };

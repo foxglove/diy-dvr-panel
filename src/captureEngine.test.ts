@@ -5,7 +5,7 @@
 import { McapIndexedReader } from "@mcap/core";
 
 import { buildMcap, DvrRecord, frameInto } from "./buildMcap";
-import { CaptureEngine, EngineConfig, FrameFn } from "./captureEngine";
+import { CaptureEngine, EngineConfig, EngineInboundMsg, FrameFn } from "./captureEngine";
 import { ClipMeta } from "./clipTypes";
 import { ClipStore } from "./opfsStore";
 import {
@@ -68,6 +68,7 @@ function harness(
     frame?: FrameFn;
     mirrorIntervalMs?: number;
     initTimeoutMs?: number;
+    maxRingBytes?: number;
     storeOptions?: FakeStoreOptions;
   } = {},
 ): Harness {
@@ -82,6 +83,7 @@ function harness(
     frame: opts.frame ?? sizedFrame(128),
     mirrorIntervalMs: opts.mirrorIntervalMs ?? NO_MIRROR,
     initTimeoutMs: opts.initTimeoutMs,
+    maxRingBytes: opts.maxRingBytes,
     // Retry backoff without real timers.
     delay: async () => {
       await Promise.resolve();
@@ -107,6 +109,18 @@ function seedClip(
     ...overrides,
   };
   backing.clips.set(meta.id, { meta, bytes: new Uint8Array(meta.byteSize) });
+}
+
+/** Deliver messages the way a live source does: one every `everyMs` of local time. */
+function feedOverTime(
+  context: Harness,
+  messages: readonly EngineInboundMsg[],
+  everyMs = 1000,
+): void {
+  for (const message of messages) {
+    context.clock.advance(everyMs);
+    context.engine.addMessage(message);
+  }
 }
 
 function config(overrides: Partial<EngineConfig> = {}): EngineConfig {
@@ -136,22 +150,27 @@ function storedClips(backing: FakeBacking): ClipMeta[] {
 
 describe("live ring buffer", () => {
   it("evicts the oldest record once the time budget is exceeded", async () => {
-    const { engine } = harness();
+    // A well-behaved source: its own times advance in step with delivery.
+    const context = harness();
+    const { engine } = context;
     engine.start();
     engine.configure(config({ budgetNanos: 5n * 1_000_000_000n }));
-    for (let sec = 100; sec <= 109; sec++) {
-      engine.addMessage(makeMsg("/a", sec));
-    }
+    feedOverTime(
+      context,
+      Array.from({ length: 10 }, (_unused, index) => makeMsg("/a", 100 + index)),
+    );
     await engine.whenIdle();
 
     const records = engine.bufferedRecords();
-    // 109 - 104 == 5s, so 104 is the oldest record that still fits the budget.
+    // Ten messages a second apart span nine seconds, so the oldest five roll off.
     expect(records[0]?.logTime).toBe(nanosOf(104));
     expect(records[records.length - 1]?.logTime).toBe(nanosOf(109));
-    const span = nanosOf(109) - nanosOf(104);
-    expect(span).toBeLessThanOrEqual(5n * 1_000_000_000n);
+    const stats = engine.stats();
+    expect(BigInt(stats.newestNanos) - BigInt(stats.oldestNanos)).toBeLessThanOrEqual(
+      5n * 1_000_000_000n,
+    );
     // Every message was counted even though older ones rolled off.
-    expect(engine.stats().messageCount).toBe(10);
+    expect(stats.messageCount).toBe(10);
   });
 
   it("evicts the oldest record once the byte budget is exceeded", async () => {
@@ -168,31 +187,48 @@ describe("live ring buffer", () => {
     expect(stats.bufferedMsgs).toBeGreaterThan(0);
     expect(stats.bufferedMsgs).toBeLessThan(10);
     // The window kept the newest messages and dropped the oldest.
-    expect(engine.bufferedRecords()[0]?.logTime).toBeGreaterThan(nanosOf(100));
-    expect(stats.newestNanos).toBe(nanosOf(109).toString());
+    const records = engine.bufferedRecords();
+    expect(records[0]?.logTime).toBeGreaterThan(nanosOf(100));
+    expect(records[records.length - 1]?.logTime).toBe(nanosOf(109));
   });
 
-  it("keeps records sorted even if arrival times themselves come out of order", () => {
-    const { engine } = harness();
+  it("stores records in delivery order, whatever the source's own times do", async () => {
+    // The ring deliberately does not sort by the source's timestamps: they can repeat, rewind,
+    // or arrive out of order, and ordering by them is what let a looped source grow unbounded.
+    const backing = createFakeBacking();
+    const context = harness({ backing });
+    const { engine } = context;
+    engine.start();
     engine.configure(config());
-    engine.addMessage(makeMsg("/a", 100));
-    engine.addMessage(makeMsg("/a", 102));
-    engine.addMessage(makeMsg("/a", 101));
+    feedOverTime(context, [makeMsg("/a", 100), makeMsg("/a", 102), makeMsg("/a", 101)]);
 
-    const times = engine.bufferedRecords().map((record) => record.logTime);
-    expect(times).toEqual([nanosOf(100), nanosOf(101), nanosOf(102)]);
+    // Kept in the order delivered, not re-sorted.
+    expect(engine.bufferedRecords().map((record) => record.logTime)).toEqual([
+      nanosOf(100),
+      nanosOf(102),
+      nanosOf(101),
+    ]);
+    // The reported span is the delivery span: three messages a second apart.
     const stats = engine.stats();
-    expect(stats.oldestNanos).toBe(nanosOf(100).toString());
-    expect(stats.newestNanos).toBe(nanosOf(102).toString());
+    expect(BigInt(stats.newestNanos) - BigInt(stats.oldestNanos)).toBe(2n * 1_000_000_000n);
+
+    // A clip still describes the source's timeline, so its bounds are the true minimum and
+    // maximum of those out-of-order times rather than the ends of the array.
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    const meta = storedClips(backing)[0];
+    expect(meta?.startNanos).toBe(nanosOf(100).toString());
+    expect(meta?.endNanos).toBe(nanosOf(102).toString());
+    expect(meta?.durationSec).toBeCloseTo(2, 6);
   });
 
-  it("windows on arrival time, not on scrambled publish times", async () => {
+  it("never lets publish times drive the window, and records them faithfully", async () => {
     // A merged multi-sensor stream: every sensor has its own clock and its own latency, so
     // publish times arrive out of order. Keying the window on them made its oldest and newest
-    // jump around — the reported span oscillated and the budget evicted in churn. Arrival order
-    // is the stable key, and it is what MCAP calls log_time.
+    // jump around — the reported span oscillated and the budget evicted in churn.
     const backing = createFakeBacking();
-    const { engine } = harness({ backing, frame: frameInto });
+    const context = harness({ backing, frame: frameInto });
+    const { engine } = context;
     engine.start();
     engine.configure(config({ budgetNanos: 5n * 1_000_000_000n }));
 
@@ -201,9 +237,10 @@ describe("live ring buffer", () => {
     // ahead). Keyed on publish time those two alone would drag the window across 150 s and
     // evict nearly everything; keyed on arrival the window is simply the last 5 s.
     const publishSeconds = [104, 101, 108, 50, 106, 103, 200, 102, 107, 105];
-    publishSeconds.forEach((publishSec, index) => {
-      engine.addMessage(makeMsg("/a", 100 + index, { publishSec }));
-    });
+    feedOverTime(
+      context,
+      publishSeconds.map((publishSec, index) => makeMsg("/a", 100 + index, { publishSec })),
+    );
 
     // (a) The window is ordered and bounded by arrival: exactly the last 5 s of it.
     const kept = engine.bufferedRecords();
@@ -266,6 +303,80 @@ describe("live ring buffer", () => {
     engine.tick();
     expect(out.all("stat")).toHaveLength(2);
     expect(out.last("stat")?.bufferedMsgs).toBe(2);
+  });
+
+  it("evicts on a looping source, whose own times cycle back to the start", async () => {
+    // The bug this exists for. A server replaying a ten-second recording on repeat reports the
+    // recording's own log time, so receive time runs 0 → 9 → 0 → 9. Windowed on that, the span
+    // never exceeds the budget, the eviction loop breaks on its first check, and the ring gains a
+    // whole loop's worth of messages every cycle — forever.
+    const context = harness();
+    const { engine } = context;
+    engine.start();
+    engine.configure(config({ budgetNanos: 10n * 1_000_000_000n }));
+
+    const messagesPerLoop = 10;
+    const perLoopCounts: number[] = [];
+    for (let loop = 0; loop < 6; loop++) {
+      feedOverTime(
+        context,
+        // Every loop replays the same ten seconds of the recording.
+        Array.from({ length: messagesPerLoop }, (_unused, index) => makeMsg("/a", index)),
+      );
+      perLoopCounts.push(engine.bufferedRecords().length);
+    }
+    await engine.whenIdle();
+
+    // A ten-second budget filled a message a second holds eleven. Once full it stays full: the
+    // counts after the first loop are all the same. Before the fix they climbed by ten each loop.
+    expect(engine.bufferedRecords().length).toBeLessThanOrEqual(messagesPerLoop + 1);
+    const [firstFull, ...rest] = perLoopCounts.slice(1);
+    expect(firstFull).toBeDefined();
+    for (const count of rest) {
+      expect(count).toBe(firstFull);
+    }
+    // Everything was still ingested; it is the oldest deliveries that went.
+    expect(engine.stats().messageCount).toBe(6 * messagesPerLoop);
+    const stats = engine.stats();
+    expect(BigInt(stats.newestNanos) - BigInt(stats.oldestNanos)).toBeLessThanOrEqual(
+      10n * 1_000_000_000n,
+    );
+  });
+
+  it("holds the ring under its hard ceiling, and says so once", async () => {
+    // Belt and braces: whatever the windowing axis is doing, the ring cannot run away. The
+    // budget here is far too long to ever trip, so only the ceiling can stop it.
+    const context = harness({ maxRingBytes: 4096 });
+    const { engine, out } = context;
+    engine.start();
+    engine.configure(config({ budgetNanos: 3600n * 1_000_000_000n }));
+
+    feedOverTime(
+      context,
+      Array.from({ length: 40 }, (_unused, index) =>
+        makeMsg("/a", index, { message: { filler: "x".repeat(512) } }),
+      ),
+    );
+    await engine.whenIdle();
+
+    expect(engine.stats().byteTotal).toBeLessThanOrEqual(4096);
+    expect(engine.bufferedRecords().length).toBeGreaterThan(0);
+    // Reported, not silently capped — and only once for this engagement.
+    const warnings = out.all("warning");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain("size ceiling");
+
+    // Draining below the ceiling re-arms it, so a later recurrence is reported again.
+    engine.reset();
+    feedOverTime(
+      context,
+      Array.from({ length: 40 }, (_unused, index) =>
+        makeMsg("/a", index, { message: { filler: "y".repeat(512) } }),
+      ),
+    );
+    await engine.whenIdle();
+    expect(out.all("warning")).toHaveLength(2);
+    expect(engine.stats().byteTotal).toBeLessThanOrEqual(4096);
   });
 
   it("frames the current window on save without clearing it", async () => {
@@ -402,12 +513,14 @@ describe("auto-save rotation", () => {
     // The rotation has already dropped the window from the live ring, and the folder write
     // pauses whenever the directory's read-write grant has lapsed — which it does on every
     // page load. Without a cached copy the window is simply gone.
-    const { engine, backing, out } = harness({ frame: sizedFrame(512) });
+    const context = harness({ frame: sizedFrame(512) });
+    const { engine, backing, out } = context;
     engine.start();
     engine.configure(config({ budgetNanos: 5n * 1_000_000_000n, autoSave: true }));
-    for (let sec = 100; sec <= 110; sec++) {
-      engine.addMessage(makeMsg("/a", sec));
-    }
+    feedOverTime(
+      context,
+      Array.from({ length: 11 }, (_unused, index) => makeMsg("/a", 100 + index)),
+    );
     await engine.whenIdle();
 
     const clips = storedClips(backing);
@@ -1458,6 +1571,7 @@ describe("framing streams instead of buffering", () => {
       topic: index % 2 === 0 ? "/a" : "/b",
       logTime: nanosOf(100 + index),
       publishTime: nanosOf(100 + index),
+      arrivalNanos: nanosOf(100 + index),
       data: new TextEncoder().encode(JSON.stringify({ index, filler })),
     }));
   }

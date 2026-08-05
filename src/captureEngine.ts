@@ -83,6 +83,8 @@ export type EngineOutput =
     }
   | { type: "clips"; clips: ClipMeta[]; cache: CacheStatus }
   | { type: "clipBytes"; id: string; meta: ClipMeta; buffer: ArrayBuffer }
+  /** Something worth telling the user about that has not broken anything. */
+  | { type: "warning"; message: string }
   | { type: "error"; message: string };
 
 /**
@@ -109,6 +111,8 @@ export type CaptureEngineDeps = {
   delay?: (ms: number) => Promise<void>;
   /** How long `store.init()` may take before the cache is declared unusable. */
   initTimeoutMs?: number;
+  /** Hard ceiling on the ring's encoded bytes. Injected so tests can reach it cheaply. */
+  maxRingBytes?: number;
 };
 
 /** Per topic: a real schema resolved from the registry, or an inferred, merged one. */
@@ -137,6 +141,14 @@ const MIRROR_STALE_INTERVALS = 3;
  */
 const MIRROR_COST_MULTIPLIER = 9;
 
+/**
+ * Hard ceiling on the live ring, whatever the windowing axis says.
+ *
+ * A legitimately full window on a heavy multi-topic stream runs to roughly a gigabyte, so this
+ * sits well clear of normal operation and only catches growth that should not be possible.
+ */
+const MAX_RING_BYTES = 2 * 1024 * 1024 * 1024;
+
 /** How long to wait for the durable store to open before giving up on it. */
 const DEFAULT_INIT_TIMEOUT_MS = 10_000;
 
@@ -153,6 +165,7 @@ export class CaptureEngine {
   readonly #frame: FrameFn;
   readonly #mirrorIntervalMs: number;
   readonly #initTimeoutMs: number;
+  readonly #maxRingBytes: number;
   readonly #delay: (ms: number) => Promise<void>;
   readonly #encoder = new TextEncoder();
 
@@ -163,6 +176,10 @@ export class CaptureEngine {
   readonly #schemaByTopic = new Map<string, TopicSchema>();
   #messageCount = 0;
   #rotations = 0;
+  /** Last arrival stamp handed out, so the axis stays monotonic even if the clock steps back. */
+  #lastArrivalNanos = 0n;
+  /** True while the ring is being held down by its hard ceiling, so the warning fires once. */
+  #atRingCeiling = false;
   /** Message count at the last emitted stat, so `tick()` only reports real changes. */
   #lastStatMessageCount = -1;
 
@@ -211,6 +228,7 @@ export class CaptureEngine {
     this.#frame = deps.frame ?? frameInto;
     this.#mirrorIntervalMs = deps.mirrorIntervalMs ?? DEFAULT_MIRROR_INTERVAL_MS;
     this.#initTimeoutMs = deps.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
+    this.#maxRingBytes = deps.maxRingBytes ?? MAX_RING_BYTES;
     this.#delay =
       deps.delay ??
       (async (ms: number) => {
@@ -351,26 +369,28 @@ export class CaptureEngine {
       existing.schema = mergeJsonSchema(existing.schema, rootSchema(msg.message));
     }
 
-    // Key the timeline off receive time — MCAP's log_time, which the app calls receive time —
-    // and not the source's publish time. Foxglove's guidance is to order on log time: publish
-    // times can arrive out of order, and on a merged multi-sensor stream each sensor has its
-    // own clock and latency, so a publish-time window's oldest and newest jump around. That
-    // made the reported span oscillate and the budget evict in churn instead of filling.
+    // Two different clocks, for two different jobs.
+    //
+    // The record keeps the source's own times: receive time as MCAP's log_time (which the app
+    // calls receive time) and publish time as publish_time, so a saved file stays faithful and
+    // orders correctly on the default log-time timeline in playback. MCAP's rule that
+    // publish_time falls back to log_time still holds, because the fallback here *is* log time.
     // https://docs.foxglove.dev/docs/visualization/playback#choosing-the-right-timestamp
     //
-    // The record still carries the message's true publish time below, so the saved MCAP has a
-    // faithful publish_time column alongside log_time, and orders correctly on the default
-    // log-time timeline in playback. MCAP's rule that publish_time falls back to log_time is
-    // satisfied, since the fallback here *is* the log time.
-    //
-    // Arrival order is also near-monotonic, so `#insertRecord` takes its append fast path
-    // almost always rather than binary-searching an insert for every message.
+    // Windowing, though, cannot use either of them. A looping or replayed source — a server
+    // replaying a recording on repeat, a bag replay, a backlog delivered after a reconnect —
+    // reports the recording's own log time, which cycles back to the start on every loop. A
+    // window measured on that never grows past the budget, so eviction never runs and the ring
+    // gains a whole loop's worth of messages every cycle, forever. So the window is measured on
+    // when *this worker* took delivery, from its own clock, clamped so it can only move forward.
     const logTime = toNanos(msg.receiveTime ?? msg.publishTime);
+    const arrivalNanos = this.#nextArrivalNanos();
     const data = this.#encodeMessage(msg.message);
     this.#insertRecord({
       topic: msg.topic,
       logTime,
       publishTime: msg.publishTime != undefined ? toNanos(msg.publishTime) : logTime,
+      arrivalNanos,
       data,
     });
     this.#byteTotal += data.byteLength;
@@ -478,6 +498,8 @@ export class CaptureEngine {
   // --- read-only views (also used by the tests) ------------------------------------
 
   public stats(): EngineStat {
+    // The reported span is the arrival span — how much capture is held — which is the same
+    // question the lookback answers, and the only one that stays meaningful on looped data.
     const oldest = this.#records[0];
     const newest = this.#records[this.#records.length - 1];
     return {
@@ -486,8 +508,8 @@ export class CaptureEngine {
       channels: this.#schemaByTopic.size,
       bufferedMsgs: this.#records.length,
       byteTotal: this.#byteTotal,
-      oldestNanos: (oldest?.logTime ?? 0n).toString(),
-      newestNanos: (newest?.logTime ?? 0n).toString(),
+      oldestNanos: (oldest?.arrivalNanos ?? 0n).toString(),
+      newestNanos: (newest?.arrivalNanos ?? 0n).toString(),
       rotations: this.#rotations,
     };
   }
@@ -695,8 +717,19 @@ export class CaptureEngine {
       topicCounts[record.topic] = (topicCounts[record.topic] ?? 0) + 1;
       topicBytes[record.topic] = (topicBytes[record.topic] ?? 0) + record.data.byteLength;
     }
-    const startNanos = snapshot[0]?.logTime ?? 0n;
-    const endNanos = snapshot[snapshot.length - 1]?.logTime ?? 0n;
+    // A clip describes the *source's* timeline, so these are log times — but the snapshot is in
+    // arrival order, and a source's own times can repeat or rewind, so take a real minimum and
+    // maximum rather than trusting the ends of the array.
+    let startNanos = snapshot[0]?.logTime ?? 0n;
+    let endNanos = startNanos;
+    for (const record of snapshot) {
+      if (record.logTime < startNanos) {
+        startNanos = record.logTime;
+      }
+      if (record.logTime > endNanos) {
+        endNanos = record.logTime;
+      }
+    }
     const spanNanos = endNanos - startNanos;
     return {
       id: this.#nextClipId(),
@@ -821,31 +854,28 @@ export class CaptureEngine {
   // --- live ring -------------------------------------------------------------------
 
   /**
-   * Insert keeping `#records` sorted ascending by `logTime`. Messages usually arrive in
-   * publish-time order (fast-path push at the tail), but a source that jumps time
-   * backward (a looping replay, say) can deliver out-of-order times. Staying sorted means
-   * `#records[0]` is always the min-`logTime` record and the last is the max, so span
-   * reporting and oldest-first eviction stay correct.
+   * The next arrival stamp, in nanoseconds, never earlier than the last one handed out.
+   *
+   * `Date.now()` can step backwards (an NTP correction, say). Clamping here means the arrival
+   * axis is monotonic by construction, which is what lets records simply be appended and lets
+   * `newest - oldest` be trusted as a span.
+   */
+  #nextArrivalNanos(): bigint {
+    const now = BigInt(Math.max(0, Math.round(this.#now()))) * 1_000_000n;
+    this.#lastArrivalNanos = now > this.#lastArrivalNanos ? now : this.#lastArrivalNanos;
+    return this.#lastArrivalNanos;
+  }
+
+  /**
+   * Append a record. The ring is ordered by arrival, and arrival only moves forward, so the
+   * newest message always belongs at the tail — no searching for a position, and `#records[0]`
+   * is always the oldest arrival.
+   *
+   * Source timestamps are deliberately not consulted here: they can repeat, rewind, or arrive
+   * out of order, and sorting by them is what let a looped source grow the ring without bound.
    */
   #insertRecord(record: DvrRecord): void {
-    const n = this.#records.length;
-    const last = this.#records[n - 1];
-    if (last == undefined || record.logTime >= last.logTime) {
-      this.#records.push(record);
-      return;
-    }
-    let lo = 0;
-    let hi = n;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      const midRecord = this.#records[mid];
-      if (midRecord != undefined && midRecord.logTime <= record.logTime) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    this.#records.splice(lo, 0, record);
+    this.#records.push(record);
   }
 
   /**
@@ -865,7 +895,8 @@ export class CaptureEngine {
         if (oldest == undefined || newest == undefined) {
           break;
         }
-        if (newest.logTime - oldest.logTime <= budgetNanos) {
+        // Arrival span, not the source's: see `addMessage`.
+        if (newest.arrivalNanos - oldest.arrivalNanos <= budgetNanos) {
           break;
         }
         if (this.#rotateOrEvict()) {
@@ -877,6 +908,36 @@ export class CaptureEngine {
         if (this.#rotateOrEvict()) {
           break;
         }
+      }
+    }
+    this.#enforceRingCeiling();
+  }
+
+  /**
+   * Last line of defence, applied in every mode: whatever the windowing axis is doing, the ring
+   * cannot exceed its hard byte ceiling.
+   *
+   * Runaway growth here means the axis is not behaving, so say so once rather than quietly
+   * capping and leaving someone to wonder where their buffer went. The latch re-arms when the
+   * ring falls back under the ceiling, so a recurrence is reported again.
+   */
+  #enforceRingCeiling(): void {
+    if (this.#byteTotal <= this.#maxRingBytes) {
+      this.#atRingCeiling = false;
+      return;
+    }
+    if (!this.#atRingCeiling) {
+      this.#atRingCeiling = true;
+      this.#emit({
+        type: "warning",
+        message:
+          "The buffer hit its size ceiling and is dropping the oldest data — the source's " +
+          "timeline may not be moving forward.",
+      });
+    }
+    while (this.#records.length > 1 && this.#byteTotal > this.#maxRingBytes) {
+      if (this.#rotateOrEvict()) {
+        break;
       }
     }
   }
@@ -903,9 +964,8 @@ export class CaptureEngine {
       this.#postStat();
       return true;
     }
-    // `#records` is sorted by logTime, so index 0 is the oldest record — shifting it
-    // always shrinks the buffered span (unlike shifting by arrival order, which can leave
-    // the min/max untouched and over-evict the window under out-of-order times).
+    // `#records` is in arrival order, so index 0 is the oldest arrival — shifting it always
+    // shrinks the window, whatever the source's own timestamps happen to be doing.
     const gone = this.#records.shift();
     if (gone != undefined) {
       this.#byteTotal -= gone.data.byteLength;

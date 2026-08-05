@@ -411,6 +411,8 @@ type OutboundMessage =
     }
   /** Sent once the worker has wired itself up, so readiness is observed rather than assumed. */
   | { type: "ready" }
+  /** Something worth surfacing that has not broken anything. */
+  | { type: "warning"; message: string }
   /** The full cached-clip list, re-broadcast after every create / evict / delete / clear. */
   | { type: "clips"; clips: ClipMeta[]; cache?: CacheStatus }
   /** One cached clip's bytes, in response to a requestClipBytes. */
@@ -1082,6 +1084,12 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
           // Readiness is the worker's word, not an assumption. Setting it at construction
           // reported "Ready" even when the worker threw before running a line.
           setWorkerReady(true);
+          break;
+        case "warning":
+          // Shown in the same pinned notice as a save problem, but amber and non-destructive:
+          // nothing failed, and no in-flight action should be released.
+          console.warn("[diy-dvr]", data.message);
+          setLastSave({ text: data.message, severity: "warn" });
           break;
         case "error":
           console.error("[diy-dvr] worker save failed", data.message);

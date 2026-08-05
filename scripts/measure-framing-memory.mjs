@@ -43,6 +43,7 @@ for (let i = 0; records.length * MESSAGE_BYTES < TARGET_BYTES; i++) {
     topic: i % 2 === 0 ? "/camera/front" : "/camera/rear",
     logTime,
     publishTime: logTime,
+    arrivalNanos: logTime, // ignored by framing; present so the record shape matches
     data: encoder.encode(JSON.stringify({ i, filler })),
   });
 }

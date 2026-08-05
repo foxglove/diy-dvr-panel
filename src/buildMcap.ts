@@ -6,8 +6,18 @@ import { McapWriter, IWritable } from "@mcap/core";
  */
 export type DvrRecord = {
   topic: string;
+  /** The source's receive time. Written as MCAP `log_time`. */
   logTime: bigint;
+  /** The source's publish time. Written as MCAP `publish_time`. */
   publishTime: bigint;
+  /**
+   * When the worker itself took delivery of this message, from its own monotonic clock.
+   *
+   * Purely the windowing axis — it is never written to the MCAP. Neither source timestamp can
+   * serve that purpose: a looping or replayed source cycles its receive time back to the start
+   * of the recording, so a window measured on it never grows and never evicts.
+   */
+  arrivalNanos: bigint;
   data: Uint8Array;
 };
 
