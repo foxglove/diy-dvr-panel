@@ -57,6 +57,11 @@ export type DvrConfig = {
   maxCacheMb: number;
   /** Seconds without any message that trigger a "gap" clip. 0 disables the trigger. */
   gapThresholdSec: number;
+  /**
+   * Recorded onto each new clip so a saved capture says where it came from. Empty means "use
+   * whatever could be detected from the app's address bar" — see `sourceLabel.ts`.
+   */
+  sourceLabel: string;
 };
 
 export const DEFAULT_CONFIG: DvrConfig = {
@@ -67,12 +72,15 @@ export const DEFAULT_CONFIG: DvrConfig = {
   autoSave: false,
   maxCacheMb: 2048,
   gapThresholdSec: 10,
+  sourceLabel: "",
 };
 
 /** Options describing the (session-only) silent-save destination for the editor. */
 export type SettingsTreeOpts = {
   canPickDir: boolean;
   saveFolderName?: string;
+  /** Shown as the Source label placeholder, so the user can see what it would default to. */
+  detectedSourceLabel?: string;
 };
 
 function budgetValueLabel(mode: BudgetMode): string {
@@ -134,7 +142,20 @@ export function buildSettingsTree(
         value: config.budgetValue,
         min: 0,
       },
+      sourceLabel: {
+        label: "Source label",
+        input: "string",
+        value: config.sourceLabel,
+        placeholder:
+          opts?.detectedSourceLabel != undefined && opts.detectedSourceLabel.length > 0
+            ? opts.detectedSourceLabel
+            : "e.g. ws://localhost:9000",
+      },
     },
+    help:
+      "The source label is recorded onto each new clip so you can tell where it came from. " +
+      "It is filled in from the connection when that can be told; type your own to use a " +
+      "friendlier name.",
   };
 
   const folderName = opts?.saveFolderName;
@@ -383,6 +404,13 @@ export function applyAction(
         return config;
       }
       return { ...config, budgetValue: next };
+    }
+    if (path[1] === "sourceLabel") {
+      const next = typeof value === "string" ? value : "";
+      if (next === config.sourceLabel) {
+        return config;
+      }
+      return { ...config, sourceLabel: next };
     }
     return config;
   }

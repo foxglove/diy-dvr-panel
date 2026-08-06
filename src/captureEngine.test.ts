@@ -692,6 +692,55 @@ describe("clip metadata", () => {
     expect(meta?.createdAt).toBe(clock.now());
   });
 
+  it("stamps the configured source label onto clips it takes", async () => {
+    const backing = createFakeBacking();
+    const context = harness({ backing });
+    const { engine } = context;
+    engine.start();
+    engine.configure(config({ sourceLabel: "ws://localhost:9000" }));
+    feedOverTime(context, [makeMsg("/a", 100)]);
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    expect(storedClips(backing)[0]?.sourceLabel).toBe("ws://localhost:9000");
+  });
+
+  it("leaves the label off entirely when there is none", async () => {
+    // Older cached clips have no such field; a new one with nothing to say should match, rather
+    // than carrying an empty string into the sidecar.
+    const backing = createFakeBacking();
+    const context = harness({ backing });
+    const { engine } = context;
+    engine.start();
+    engine.configure(config());
+    feedOverTime(context, [makeMsg("/a", 100)]);
+
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+    expect(storedClips(backing)[0]?.sourceLabel).toBeUndefined();
+  });
+
+  it("applies a label change only to clips taken afterwards", async () => {
+    const backing = createFakeBacking();
+    const context = harness({ backing });
+    const { engine, clock } = context;
+    engine.start();
+    engine.configure(config({ sourceLabel: "first source" }));
+    feedOverTime(context, [makeMsg("/a", 100)]);
+    engine.createClip("manual-clip");
+    await engine.whenIdle();
+
+    clock.advance(1000);
+    engine.configure(config({ sourceLabel: "second source" }));
+    engine.createClip("backgrounded");
+    await engine.whenIdle();
+
+    expect(storedClips(backing).map((clip) => clip.sourceLabel)).toEqual([
+      "first source",
+      "second source",
+    ]);
+  });
+
   it("frames a real indexed MCAP with the default framer", async () => {
     const backing = createFakeBacking();
     const clock = createFakeClock();

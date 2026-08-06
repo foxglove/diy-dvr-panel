@@ -88,6 +88,13 @@ export type ClipMeta = {
   createdAt: number;
   /** False only for the live mirror, which is still being updated. */
   sealed: boolean;
+  /**
+   * Where this capture came from, as configured or detected when it was taken.
+   *
+   * Optional: clips cached by an earlier build carry no label, and it is stamped at capture
+   * time, so changing it later only affects clips taken afterwards.
+   */
+  sourceLabel?: string;
 };
 
 /**

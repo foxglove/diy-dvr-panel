@@ -56,6 +56,8 @@ export type EngineConfig = {
   maxCacheBytes?: number;
   /** Silence longer than this fires a `gap` clip. Zero or undefined disables it. */
   gapMs?: number;
+  /** Stamped onto clips taken from here on, so a capture says where it came from. */
+  sourceLabel?: string;
 };
 
 export type EngineStat = {
@@ -191,6 +193,7 @@ export class CaptureEngine {
   #enabledSet: Set<string> | undefined = undefined;
   #maxCacheBytes: number | undefined = undefined;
   #gapMs: number | undefined = undefined;
+  #sourceLabel = "";
 
   // --- clip cache ---
   #clips: ClipMeta[] = [];
@@ -326,6 +329,7 @@ export class CaptureEngine {
     this.#enabledSet = new Set(config.enabledTopics);
     this.#maxCacheBytes = config.maxCacheBytes;
     this.#gapMs = config.gapMs;
+    this.#sourceLabel = config.sourceLabel ?? "";
     // A newly-tightened budget may already be exceeded by the current buffer.
     this.#enforceBudget();
     this.#postStat();
@@ -744,6 +748,8 @@ export class CaptureEngine {
       topicBytes,
       createdAt: this.#now(),
       sealed: spec.sealed,
+      // Stamped as it stands now: a label set later applies only to later clips.
+      sourceLabel: this.#sourceLabel.length > 0 ? this.#sourceLabel : undefined,
     };
   }
 

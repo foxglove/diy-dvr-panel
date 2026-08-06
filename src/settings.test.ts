@@ -25,6 +25,10 @@ describe("DEFAULT_CONFIG", () => {
     expect(DEFAULT_CONFIG.maxCacheMb).toBe(2048);
     expect(DEFAULT_CONFIG.gapThresholdSec).toBe(10);
   });
+
+  it("starts with no source label, so the detected one is used", () => {
+    expect(DEFAULT_CONFIG.sourceLabel).toBe("");
+  });
 });
 
 describe("applyAction — cache node", () => {
@@ -95,6 +99,39 @@ describe("applyAction — existing nodes still behave", () => {
     expect(off.disabledTopics).toEqual(["/scan"]);
     const on = applyAction(off, update(["topics", "source", "/scan"], true));
     expect(on.disabledTopics).toEqual([]);
+  });
+});
+
+describe("source label", () => {
+  it("offers a text field showing the current value", () => {
+    const config: DvrConfig = { ...DEFAULT_CONFIG, sourceLabel: "Bench robot" };
+    const field = buildSettingsTree(config, [], noop).nodes.general?.fields?.sourceLabel;
+    expect(field).toMatchObject({ label: "Source label", input: "string", value: "Bench robot" });
+  });
+
+  it("shows what it would default to as the placeholder", () => {
+    const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop, {
+      canPickDir: true,
+      detectedSourceLabel: "ws://localhost:9000",
+    });
+    expect(tree.nodes.general?.fields?.sourceLabel).toMatchObject({
+      placeholder: "ws://localhost:9000",
+    });
+  });
+
+  it("suggests the shape of one when nothing could be detected", () => {
+    const tree = buildSettingsTree(DEFAULT_CONFIG, [], noop, { canPickDir: true });
+    expect(tree.nodes.general?.fields?.sourceLabel).toMatchObject({
+      placeholder: "e.g. ws://localhost:9000",
+    });
+  });
+
+  it("updates on change and keeps the same reference otherwise", () => {
+    const next = applyAction(DEFAULT_CONFIG, update(["general", "sourceLabel"], "Bench robot"));
+    expect(next.sourceLabel).toBe("Bench robot");
+    expect(applyAction(next, update(["general", "sourceLabel"], "Bench robot"))).toBe(next);
+    // A non-string value clears it rather than storing something unrenderable.
+    expect(applyAction(next, update(["general", "sourceLabel"], undefined)).sourceLabel).toBe("");
   });
 });
 

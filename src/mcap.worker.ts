@@ -23,6 +23,7 @@ type InboundMessage =
       enabledTopics: string[];
       maxCacheBytes?: number;
       gapMs?: number;
+      sourceLabel?: string;
     }
   | { type: "save" }
   | { type: "reset" }
@@ -76,17 +77,15 @@ ctx.onmessage = (event) => {
     case "msg":
       engine.addMessage(data);
       break;
-    case "config":
-      engine.configure({
-        budgetMode: data.budgetMode,
-        budgetNanos: data.budgetNanos,
-        budgetBytes: data.budgetBytes,
-        autoSave: data.autoSave,
-        enabledTopics: data.enabledTopics,
-        maxCacheBytes: data.maxCacheBytes,
-        gapMs: data.gapMs,
-      });
+    case "config": {
+      // Passed through whole rather than copied field by field. The inbound message is the
+      // engine's config plus a `type` tag, and listing the fields here meant every new setting
+      // had to be remembered in two places — one that was easy to miss, since the engine's own
+      // tests configure it directly and never see this hop.
+      const { type: _type, ...engineConfig } = data;
+      engine.configure(engineConfig);
       break;
+    }
     case "save":
       engine.save();
       break;

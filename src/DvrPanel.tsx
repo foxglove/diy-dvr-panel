@@ -14,6 +14,7 @@ import {
   DvrConfig,
   isTopicEnabled,
 } from "./settings";
+import { detectSourceLabel, effectiveSourceLabel } from "./sourceLabel";
 
 // Extensions render plain React with no access to the app's MUI theme, so we drive
 // body colors from the watched color scheme with a small inline-style palette.
@@ -558,7 +559,17 @@ function formatDurationSec(seconds: number): string {
  * source that publishes no time.
  */
 function formatClock(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString();
+  // Date as well as time: a cache can hold clips from several days, and a bare clock reading
+  // cannot tell them apart. Kept compact rather than a full locale date-time, because this sits
+  // in a wrapping row inside a panel that is often only a few hundred pixels wide. The year is
+  // the casualty; clips that old have long since been evicted.
+  return new Date(epochMs).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 /**
@@ -831,6 +842,9 @@ function ClipRow({
         <span>{formatDurationSec(clip.durationSec)}</span>
         <span>{formatBytes(clip.byteSize)}</span>
         <span>{clip.messageCount} msgs</span>
+        {clip.sourceLabel != undefined && clip.sourceLabel.length > 0 && (
+          <span style={{ wordBreak: "break-all" }}>{clip.sourceLabel}</span>
+        )}
       </div>
       {expanded && (
         <div
@@ -986,6 +1000,11 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       timers.clear();
     };
   }, []);
+
+  // Detected once per mount. The app re-runs initPanel when the connection changes, so a new
+  // source gets a fresh look at the address bar without needing to poll it.
+  const detectedSourceLabel = useMemo(() => detectSourceLabel(), []);
+  const sourceLabel = effectiveSourceLabel(config.sourceLabel, detectedSourceLabel);
 
   // Source topics default on, generated ones default off — see isTopicEnabled.
   const enabledTopics = useMemo(
@@ -1242,8 +1261,9 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
       enabledTopics: enabledTopics.map((topic) => topic.name),
       maxCacheBytes: mbToBytes(settled.maxCacheMb),
       gapMs: Math.round(settled.gapThresholdSec * 1000),
+      sourceLabel,
     };
-  }, [config.budgetMode, config.autoSave, settled, enabledTopics, saveFolderName]);
+  }, [config.budgetMode, config.autoSave, settled, enabledTopics, saveFolderName, sourceLabel]);
 
   useEffect(() => {
     workerRef.current?.postMessage(workerConfig);
@@ -1347,9 +1367,13 @@ function DvrPanel({ context }: { context: PanelExtensionContext }): React.JSX.El
   // (Re)render the settings editor on mount and whenever inputs change.
   useEffect(() => {
     context.updatePanelSettingsEditor(
-      buildSettingsTree(config, topics, actionHandler, { canPickDir, saveFolderName }),
+      buildSettingsTree(config, topics, actionHandler, {
+        canPickDir,
+        saveFolderName,
+        detectedSourceLabel,
+      }),
     );
-  }, [context, config, topics, saveFolderName, actionHandler]);
+  }, [context, config, topics, saveFolderName, actionHandler, detectedSourceLabel]);
 
   // The click gesture is live now but gone by the time the worker posts the bytes back, so
   // acquire the RW grant here (query-then-request). The async reply handler then only
