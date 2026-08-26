@@ -6,8 +6,18 @@ import { McapWriter, IWritable } from "@mcap/core";
  */
 export type DvrRecord = {
   topic: string;
+  /** The source's receive time. Written as MCAP `log_time`. */
   logTime: bigint;
+  /** The source's publish time. Written as MCAP `publish_time`. */
   publishTime: bigint;
+  /**
+   * When the worker itself took delivery of this message, from its own monotonic clock.
+   *
+   * Purely the windowing axis — it is never written to the MCAP. Neither source timestamp can
+   * serve that purpose: a looping or replayed source cycles its receive time back to the start
+   * of the recording, so a window measured on it never grows and never evicts.
+   */
+  arrivalNanos: bigint;
   data: Uint8Array;
 };
 
@@ -18,8 +28,14 @@ export type DvrSchema = {
   data: Uint8Array;
 };
 
-/** In-memory {@link IWritable} that accumulates chunks and concatenates on demand. */
-class MemoryWritable implements IWritable {
+/**
+ * In-memory {@link IWritable} that accumulates chunks and concatenates on demand.
+ *
+ * Only for the paths that genuinely need the finished bytes in memory — handing a buffer to the
+ * panel to save, or a test inspecting output. Anything writing to storage should stream through
+ * {@link frameInto} instead, which never holds more than one chunk.
+ */
+export class MemoryWritable implements IWritable {
   #chunks: Uint8Array[] = [];
   #size = 0;
 
@@ -45,19 +61,23 @@ class MemoryWritable implements IWritable {
 }
 
 /**
- * Build a fully indexed MCAP (chunks + chunk index + message index + statistics +
- * summary offsets) from buffered records. Indexed output means the Foxglove app
- * uses the indexed reader (no unindexed-size cap) and topics carry schemas.
+ * Write a fully indexed MCAP (chunks + chunk index + message index + statistics + summary
+ * offsets) into `writable`. Indexed output means the Foxglove app uses the indexed reader (no
+ * unindexed-size cap) and topics carry schemas.
  *
- * A panel only sees schema *names*, not definitions, so `schemaByTopic` carries a
- * JSON Schema synthesized from the observed message shapes (see `inferSchema.ts`).
- * Messages are `json`-encoded; schemas are `jsonschema`-encoded.
+ * A panel only sees schema *names*, not definitions, so `schemaByTopic` carries a JSON Schema
+ * synthesized from the observed message shapes (see `inferSchema.ts`). Messages are
+ * `json`-encoded; schemas are `jsonschema`-encoded.
+ *
+ * The writer is forward-only — records stream out as they are added and the summary and indexes
+ * are appended at the end, with no seeking back — so `writable` can be a file being appended to
+ * rather than a buffer being grown.
  */
-export async function buildMcap(
+export async function frameInto(
+  writable: IWritable,
   records: readonly DvrRecord[],
   schemaByTopic: ReadonlyMap<string, DvrSchema>,
-): Promise<Uint8Array> {
-  const writable = new MemoryWritable();
+): Promise<void> {
   const writer = new McapWriter({
     writable,
     useChunks: true,
@@ -101,5 +121,17 @@ export async function buildMcap(
   }
 
   await writer.end();
+}
+
+/**
+ * Frame to a buffer in memory. A convenience wrapper over {@link frameInto} for callers that
+ * need the bytes themselves; storage writes should stream instead.
+ */
+export async function buildMcap(
+  records: readonly DvrRecord[],
+  schemaByTopic: ReadonlyMap<string, DvrSchema>,
+): Promise<Uint8Array> {
+  const writable = new MemoryWritable();
+  await frameInto(writable, records, schemaByTopic);
   return writable.toUint8Array();
 }

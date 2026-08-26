@@ -1,0 +1,11 @@
+{
+  // ts-jest compiles the tests with this config. The only differences from the main
+  // tsconfig are the module format and resolution: the app build targets a bundler
+  // (esnext modules), while jest's default runtime requires CommonJS.
+  "extends": "./tsconfig.json",
+
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node"
+  }
+}

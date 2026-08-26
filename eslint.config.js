@@ -27,4 +27,9 @@ module.exports = tseslint.config(
       "react-hooks/exhaustive-deps": "error",
     },
   },
+  {
+    // Co-located unit tests: adds the jest globals and the jest rule set.
+    files: ["src/**/*.test.ts"],
+    extends: [foxglove.configs.jest],
+  },
 );

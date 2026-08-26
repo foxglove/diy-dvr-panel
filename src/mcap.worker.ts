@@ -1,31 +1,19 @@
-// Web Worker: owns the capture buffer and all encoding.
+// Web Worker: the panel's capture host.
 //
 // Bundled to a string by scripts/bundle-worker.mjs (esbuild, with @mcap/core) and
-// instantiated from a Blob URL by the panel, so it travels inside the extension
-// bundle. Messages arrive decoded from the panel; the worker JSON-encodes them and,
-// on save, frames them into a fully indexed MCAP with per-topic synthesized schemas.
+// instantiated from a Blob URL by the panel, so it travels inside the extension bundle.
 //
-// v1 adds a bounded ring buffer (time / byte budget) and auto-save rotation: when
-// auto-save is on and the budget is exceeded, the whole window is snapshotted,
-// synchronously cleared, and asynchronously framed to an MCAP (posted as "saved")
-// instead of dropping data — yielding contiguous rotated files. The panel owns all
-// file writing; the worker only posts buffers.
+// This file is deliberately thin: all capture, clip, mirror, and eviction logic lives in
+// `captureEngine.ts`, which holds no worker or DOM references and is unit-tested in Node.
+// The adapter's whole job is to bind that engine to the things only a worker has — the
+// real OPFS store, `Date.now`, `postMessage`, and a periodic timer — and to translate the
+// inbound/outbound message unions.
 
-import { buildMcap, DvrRecord, DvrSchema } from "./buildMcap";
-import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
-import { resolveSchema } from "./schemaRegistry";
-
-type Time = { sec: number; nsec: number };
+import { CaptureEngine, EngineInboundMsg, EngineOutput } from "./captureEngine";
+import { createOpfsStore } from "./opfsStore";
 
 type InboundMessage =
-  | {
-      type: "msg";
-      topic: string;
-      schemaName?: string;
-      receiveTime?: Time;
-      publishTime?: Time;
-      message: unknown;
-    }
+  | ({ type: "msg" } & EngineInboundMsg)
   | {
       type: "config";
       budgetMode: "time" | "bytes";
@@ -33,9 +21,17 @@ type InboundMessage =
       budgetBytes?: number;
       autoSave: boolean;
       enabledTopics: string[];
+      maxCacheBytes?: number;
+      gapMs?: number;
+      sourceLabel?: string;
     }
   | { type: "save" }
-  | { type: "reset" };
+  | { type: "reset" }
+  /** Panel-observed events that should snapshot the buffer into a durable clip. */
+  | { type: "trigger"; tag: "backgrounded" | "closing" | "manual-clip" }
+  | { type: "deleteClip"; id: string }
+  | { type: "clearClips" }
+  | { type: "requestClipBytes"; id: string };
 
 // The DOM lib types `self.postMessage` like Window's; cast to the worker shape.
 const ctx = self as unknown as {
@@ -43,298 +39,70 @@ const ctx = self as unknown as {
   postMessage: (message: unknown, transfer?: Transferable[]) => void;
 };
 
-const encoder = new TextEncoder();
-
-const records: DvrRecord[] = [];
-// Running total of buffered re-encoded JSON payload bytes (sum of data.byteLength).
-let byteTotal = 0;
-// Per topic: a fixed schema resolved from the registry (real schema), or an
-// inferred one we keep merging as messages arrive.
-type TopicSchema = { name: string; schema: JsonSchema; fromRegistry: boolean };
-const schemaByTopic = new Map<string, TopicSchema>();
-let messageCount = 0;
-let rotations = 0;
-
-// Latest config. Unbounded / no-autosave until the first "config" message arrives.
-let budgetMode: "time" | "bytes" = "time";
-let budgetNanos: bigint | undefined = undefined;
-let budgetBytes: number | undefined = undefined;
-let autoSave = false;
-let enabledSet: Set<string> | undefined = undefined;
-
-function toNanos(time?: Time): bigint {
-  if (time == undefined) {
-    return 0n;
-  }
-  return BigInt(time.sec) * 1_000_000_000n + BigInt(time.nsec);
-}
-
-function toBase64(view: ArrayBufferView): string {
-  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(
-      null,
-      bytes.subarray(i, i + chunkSize) as unknown as number[],
-    );
-  }
-  return btoa(binary);
-}
-
-function jsonReplacer(_key: string, value: unknown): unknown {
-  if (typeof value === "bigint") {
-    return Number(value);
-  }
-  // Unsigned byte arrays -> base64 string (matches contentEncoding:base64 in the
-  // schema). Int8Array is intentionally NOT base64'd: the app's normalizeInt8Array
-  // (OccupancyGrid.data) rejects a Uint8Array, so it must stay a number array.
-  if (value instanceof Uint8Array) {
-    return toBase64(value);
-  }
-  // Other typed arrays (Int8Array, Float32Array, etc.) -> plain number arrays.
-  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-    return Array.from(value as unknown as ArrayLike<number>);
-  }
-  return value;
-}
-
-function encodeMessage(message: unknown): Uint8Array {
-  try {
-    if (message == undefined) {
-      return encoder.encode("null");
-    }
-    const json = JSON.stringify(message, jsonReplacer);
-    return encoder.encode(json);
-  } catch (err) {
-    return encoder.encode(JSON.stringify({ __dvr_encode_error: String(err) }));
-  }
-}
-
-/** Snapshot the current per-topic schemas into the framing shape (name/encoding/data). */
-function snapshotSchemaMap(): Map<string, DvrSchema> {
-  const schemas = new Map<string, DvrSchema>();
-  for (const [topic, entry] of schemaByTopic) {
-    schemas.set(topic, {
-      name: entry.name,
-      encoding: "jsonschema",
-      data: encoder.encode(JSON.stringify(entry.schema)),
-    });
-  }
-  return schemas;
-}
-
 /**
- * Insert a record keeping `records` sorted ascending by `logTime`. Messages usually
- * arrive in publish-time order (fast-path push at the tail), but a source that jumps
- * time backward (e.g. a looping replay) can deliver out-of-order times. Keeping the
- * array sorted means `records[0]` is always the min-`logTime` record and the last is
- * the max, so span reporting and oldest-first eviction stay correct.
+ * How often the engine is polled. Two jobs need wall-clock time rather than message
+ * arrival: the WS-gap trigger and the throttled OPFS mirror.
+ *
+ * Browsers throttle worker timers while a tab is in the background, so this can slow to a
+ * crawl exactly when a gap would fire. That is why the panel also posts an explicit
+ * `backgrounded` trigger when the tab is hidden, instead of relying on this alone.
  */
-function insertRecord(record: DvrRecord): void {
-  const n = records.length;
-  const last = records[n - 1];
-  if (last == undefined || record.logTime >= last.logTime) {
-    records.push(record);
-    return;
-  }
-  let lo = 0;
-  let hi = n;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    const midRecord = records[mid];
-    if (midRecord != undefined && midRecord.logTime <= record.logTime) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  records.splice(lo, 0, record);
-}
+const TICK_INTERVAL_MS = 1000;
 
-function postStat(): void {
-  // `records` is kept sorted by logTime, so the ends are the min/max of the window.
-  const oldest = records[0];
-  const newest = records[records.length - 1];
-  ctx.postMessage({
-    type: "stat",
-    messageCount,
-    channels: schemaByTopic.size,
-    bufferedMsgs: records.length,
-    byteTotal,
-    oldestNanos: (oldest?.logTime ?? 0n).toString(),
-    newestNanos: (newest?.logTime ?? 0n).toString(),
-    rotations,
-  });
-}
+const engine = new CaptureEngine({
+  store: createOpfsStore(),
+  now: () => Date.now(),
+  emit: (message: EngineOutput, transfer?: Transferable[]) => {
+    ctx.postMessage(message, transfer);
+  },
+});
 
-/** Async-frame a snapshot to an MCAP and post it as a rotation "saved" event. */
-function flushRotation(snapshot: DvrRecord[], snapshotSchemas: Map<string, DvrSchema>): void {
-  buildMcap(snapshot, snapshotSchemas)
-    .then((bytes) => {
-      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      ctx.postMessage(
-        { type: "saved", buffer, messageCount, channels: schemaByTopic.size, rotation: true },
-        [buffer],
-      );
-    })
-    .catch((err: unknown) => {
-      ctx.postMessage({ type: "error", message: String(err) });
-    });
-}
+// Rehydrate the clip list from OPFS and promote any mirror a previous worker instance left
+// behind. This is how clips (and the last mirrored window) survive the panel teardown that
+// happens on a reconnect.
+engine.start();
 
-/**
- * Enforce the configured budget after a push. When auto-save is off this is a
- * true ring (evict oldest). When auto-save is on, a budget-exceed snapshots the
- * whole window, clears it synchronously (the re-entrancy guard — the next message
- * starts a fresh window, so a slow build can never double-flush), and kicks off an
- * async build. Schemas persist across windows so every rotated file is self-contained.
- */
-function enforceBudget(): void {
-  if (budgetMode === "time" && budgetNanos != undefined) {
-    while (records.length > 1) {
-      const oldest = records[0];
-      const newest = records[records.length - 1];
-      if (oldest == undefined || newest == undefined) {
-        break;
-      }
-      if (newest.logTime - oldest.logTime <= budgetNanos) {
-        break;
-      }
-      if (rotateOrEvict()) {
-        break; // rotation cleared the buffer; nothing left to trim
-      }
-    }
-  } else if (budgetMode === "bytes" && budgetBytes != undefined) {
-    while (records.length > 0 && byteTotal > budgetBytes) {
-      if (rotateOrEvict()) {
-        break;
-      }
-    }
-  }
-}
+setInterval(() => {
+  engine.tick();
+}, TICK_INTERVAL_MS);
 
-/**
- * Evict the oldest record (ring) or rotate the whole window (auto-save).
- * Returns true when a rotation cleared the buffer (caller should stop looping).
- */
-function rotateOrEvict(): boolean {
-  if (autoSave) {
-    const snapshot = records.slice();
-    const snapshotSchemas = snapshotSchemaMap();
-    records.length = 0;
-    byteTotal = 0;
-    rotations++;
-    flushRotation(snapshot, snapshotSchemas);
-    postStat();
-    return true;
-  }
-  // `records` is sorted by logTime, so records[0] is the oldest record — shifting it
-  // always shrinks the buffered span (unlike shifting by arrival order, which can
-  // leave the min/max untouched and over-evict the window under out-of-order times).
-  const gone = records.shift();
-  if (gone != undefined) {
-    byteTotal -= gone.data.byteLength;
-  }
-  return false;
-}
-
-function handleMessage(msg: Extract<InboundMessage, { type: "msg" }>): void {
-  // Defensively drop messages for a topic that was just disabled but is still in
-  // flight (the panel already only subscribes to enabled topics).
-  if (enabledSet != undefined && enabledSet.size > 0 && !enabledSet.has(msg.topic)) {
-    return;
-  }
-
-  const name =
-    msg.schemaName != undefined && msg.schemaName.length > 0 ? msg.schemaName : msg.topic;
-  const existing = schemaByTopic.get(msg.topic);
-  if (existing == undefined) {
-    // First message on this topic: prefer a real schema from the registry.
-    const registrySchema = name.length > 0 ? resolveSchema(name) : undefined;
-    schemaByTopic.set(
-      msg.topic,
-      registrySchema
-        ? { name, schema: registrySchema, fromRegistry: true }
-        : { name, schema: rootSchema(msg.message), fromRegistry: false },
-    );
-  } else if (!existing.fromRegistry) {
-    // Unknown schema: keep refining the inferred shape as more messages arrive.
-    existing.schema = mergeJsonSchema(existing.schema, rootSchema(msg.message));
-  }
-
-  // Key the buffered/saved timeline off the message's published time (the source's
-  // own clock) when present, falling back to receive/wall time. This keeps the ring
-  // and the saved MCAP consistent even when arrival order differs from publish order.
-  const logTime = toNanos(msg.publishTime ?? msg.receiveTime);
-  const data = encodeMessage(msg.message);
-  insertRecord({
-    topic: msg.topic,
-    logTime,
-    publishTime: msg.publishTime != undefined ? toNanos(msg.publishTime) : logTime,
-    data,
-  });
-  byteTotal += data.byteLength;
-
-  messageCount++;
-
-  enforceBudget();
-
-  if (messageCount % 200 === 0) {
-    postStat();
-  }
-}
-
-function handleConfig(cfg: Extract<InboundMessage, { type: "config" }>): void {
-  budgetMode = cfg.budgetMode;
-  budgetNanos = cfg.budgetNanos;
-  budgetBytes = cfg.budgetBytes;
-  autoSave = cfg.autoSave;
-  enabledSet = new Set(cfg.enabledTopics);
-  // A newly-tightened budget may already be exceeded by the current buffer.
-  enforceBudget();
-  postStat();
-}
-
-function handleSave(): void {
-  // Manual save is non-destructive: frame the current window without clearing.
-  const schemas = snapshotSchemaMap();
-  buildMcap(records, schemas)
-    .then((bytes) => {
-      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      ctx.postMessage(
-        { type: "saved", buffer, messageCount, channels: schemaByTopic.size, rotation: false },
-        [buffer],
-      );
-    })
-    .catch((err: unknown) => {
-      ctx.postMessage({ type: "error", message: String(err) });
-    });
-}
-
-function handleReset(): void {
-  records.length = 0;
-  byteTotal = 0;
-  schemaByTopic.clear();
-  messageCount = 0;
-  rotations = 0;
-  postStat();
-}
+// Announce readiness only once everything above is wired. The panel used to assume the worker
+// was ready the moment it was constructed, so a throw at module scope here — a CSP that blocks
+// the blob, a missing API — left the panel reporting "Ready" while nothing ever arrived.
+ctx.postMessage({ type: "ready" });
 
 ctx.onmessage = (event) => {
   const data = event.data;
   switch (data.type) {
     case "msg":
-      handleMessage(data);
+      engine.addMessage(data);
       break;
-    case "config":
-      handleConfig(data);
+    case "config": {
+      // Passed through whole rather than copied field by field. The inbound message is the
+      // engine's config plus a `type` tag, and listing the fields here meant every new setting
+      // had to be remembered in two places — one that was easy to miss, since the engine's own
+      // tests configure it directly and never see this hop.
+      const { type: _type, ...engineConfig } = data;
+      engine.configure(engineConfig);
       break;
+    }
     case "save":
-      handleSave();
+      engine.save();
       break;
     case "reset":
-      handleReset();
+      engine.reset();
+      break;
+    case "trigger":
+      engine.createClip(data.tag);
+      break;
+    case "deleteClip":
+      engine.deleteClip(data.id);
+      break;
+    case "clearClips":
+      engine.clearClips();
+      break;
+    case "requestClipBytes":
+      engine.requestClipBytes(data.id);
       break;
   }
 };
