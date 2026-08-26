@@ -27,15 +27,20 @@
 import { IWritable } from "@mcap/core";
 
 import { DvrRecord, DvrSchema, frameInto, MemoryWritable } from "./buildMcap";
+import { payloadBytes, Time, toArrayBuffer, toNanos, withTimeout } from "./captureUtil";
 import { ClipMeta, ClipTrigger, PanelTrigger, planEviction } from "./clipTypes";
 import { JsonSchema, mergeJsonSchema, rootSchema } from "./inferSchema";
+import { encodeMessage } from "./messageEncoding";
 import { ClipStore, ClipStoreMode } from "./opfsStore";
 import { resolveSchema } from "./schemaRegistry";
 
 /** How often the live ring is mirrored to durable storage, unless overridden. */
 export const DEFAULT_MIRROR_INTERVAL_MS = 5000;
 
-export type Time = { sec: number; nsec: number };
+/** For the schema JSON only; message bodies go through `encodeMessage`. */
+const encoder = new TextEncoder();
+
+export type { Time };
 
 /** One decoded message forwarded from the panel's `onRender`. */
 export type EngineInboundMsg = {
@@ -169,7 +174,6 @@ export class CaptureEngine {
   readonly #initTimeoutMs: number;
   readonly #maxRingBytes: number;
   readonly #delay: (ms: number) => Promise<void>;
-  readonly #encoder = new TextEncoder();
 
   // --- live ring ---
   /** Kept sorted ascending by `logTime`, so the ends are always the window's min/max. */
@@ -389,7 +393,7 @@ export class CaptureEngine {
     // when *this worker* took delivery, from its own clock, clamped so it can only move forward.
     const logTime = toNanos(msg.receiveTime ?? msg.publishTime);
     const arrivalNanos = this.#nextArrivalNanos();
-    const data = this.#encodeMessage(msg.message);
+    const data = encodeMessage(msg.message);
     this.#insertRecord({
       topic: msg.topic,
       logTime,
@@ -1010,21 +1014,10 @@ export class CaptureEngine {
       schemas.set(topic, {
         name: entry.name,
         encoding: "jsonschema",
-        data: this.#encoder.encode(JSON.stringify(entry.schema)),
+        data: encoder.encode(JSON.stringify(entry.schema)),
       });
     }
     return schemas;
-  }
-
-  #encodeMessage(message: unknown): Uint8Array {
-    try {
-      if (message == undefined) {
-        return this.#encoder.encode("null");
-      }
-      return this.#encoder.encode(JSON.stringify(message, jsonReplacer));
-    } catch (err) {
-      return this.#encoder.encode(JSON.stringify({ __dvr_encode_error: String(err) }));
-    }
   }
 
   // --- plumbing --------------------------------------------------------------------
@@ -1076,80 +1069,4 @@ export class CaptureEngine {
       await operation();
     });
   }
-}
-
-/** Reject if `work` has not settled within `ms`. The timer is always cleared. */
-async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
-  // Collected rather than held in a `let`, so the always-run cleanup does not depend on
-  // control-flow analysis reaching into the executor.
-  const timers: Array<ReturnType<typeof setTimeout>> = [];
-  try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_resolve, reject) => {
-        timers.push(
-          setTimeout(() => {
-            reject(new Error(`Timed out trying to ${what}`));
-          }, ms),
-        );
-      }),
-    ]);
-  } finally {
-    for (const timer of timers) {
-      clearTimeout(timer);
-    }
-  }
-}
-
-/** Total encoded payload bytes in a snapshot: a close, cheap proxy for its framed size. */
-function payloadBytes(records: readonly DvrRecord[]): number {
-  return records.reduce((total, record) => total + record.data.byteLength, 0);
-}
-
-function toNanos(time?: Time): bigint {
-  if (time == undefined) {
-    return 0n;
-  }
-  return BigInt(time.sec) * 1_000_000_000n + BigInt(time.nsec);
-}
-
-/** Detach a view into its own transferable ArrayBuffer. */
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
-
-function toBase64(view: ArrayBufferView): string {
-  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(
-      null,
-      bytes.subarray(i, i + chunkSize) as unknown as number[],
-    );
-  }
-  return btoa(binary);
-}
-
-function jsonReplacer(_key: string, value: unknown): unknown {
-  if (typeof value === "bigint") {
-    // JSON has no 64-bit integer. Within the double-safe range a number is what consumers
-    // expect from an integer field, but past it a number would be a *different* value — so
-    // emit the exact decimal string instead of silently rounding. (inferSchema already types
-    // bigint fields as strings, so a string is the more consistent of the two.)
-    return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
-      ? Number(value)
-      : value.toString();
-  }
-  // Unsigned byte arrays -> base64 string (matches contentEncoding:base64 in the schema).
-  // Int8Array is intentionally NOT base64'd: the app's normalizeInt8Array
-  // (OccupancyGrid.data) rejects a Uint8Array, so it must stay a number array.
-  if (value instanceof Uint8Array) {
-    return toBase64(value);
-  }
-  // Other typed arrays (Int8Array, Float32Array, etc.) -> plain number arrays.
-  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-    return Array.from(value as unknown as ArrayLike<number>);
-  }
-  return value;
 }
